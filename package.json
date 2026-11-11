@@ -1,0 +1,20 @@
+{
+  "name": "hermes-cartridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A handheld ROM emulator pane that runs while Hermes works and pauses when it needs you.",
+  "license": "MIT",
+  "homepage": "https://github.com/Frazzlesprite/hermes-cartridge",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "test": "node --test \"tests/**/*.mjs\"",
+    "verify": "npm run build && npm test",
+    "state-fields": "node tools/derive-state-fields.mjs vendor/jsgbc-core/src/StateManager.ts > src/core/state-fields.js"
+  },
+  "devDependencies": {
+    "esbuild": ">=0.28.0 <0.29.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}

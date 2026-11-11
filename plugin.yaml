@@ -1,0 +1,26 @@
+name: cartridge
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: A handheld ROM emulator pane that runs while Hermes works and pauses the moment it needs you.
+license: MIT
+  homepage: https://github.com/Frazzlesprite/hermes-cartridge
+tags: [desktop, emulator, break, focus]
+requires_hermes: ">=0.23.0"
+config_schema:
+  default_mode:
+    type: str
+    default: interrupted
+    description: "interrupted (play during a turn, pause for approvals) or always (keep playing through turns)"
+  palette:
+    type: str
+    default: pocket
+    description: "Mono palette: pocket, grey or green. Colour games always use their own."
+  scale:
+    type: str
+    default: auto
+    description: "Integer pixel scale: auto, 2x, 3x or 4x."
+  audio:
+    type: bool
+    default: true
+    description: "Play audio. Starts on your first click in the pane, per browser autoplay rules."

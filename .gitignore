@@ -1,0 +1,22 @@
+node_modules/
+build/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+
+# Rule 17: no committed Python bytecode. Running the plugin locally makes this.
+__pycache__/
+*.pyc
+*.pyo
+
+# User ROMs must never be committed. Point the picker at a file on disk.
+*.gb
+*.gbc
+*.sav
+!roms/selftest.gb
+
+# Loose save states from local testing
+tmp/
+scratch/

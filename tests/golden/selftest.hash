@@ -1,0 +1,4 @@
+# Cartridge self-test golden framebuffer hash
+# test: tests/test_core.mjs  rom: roms/selftest.gb  frames: 120
+# algorithm: FNV-1a 32-bit over RGBA (160x144x4) of the final frame
+1bdf7674
