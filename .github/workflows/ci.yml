@@ -37,22 +37,7 @@ jobs:
         run: npm test
 
       - name: plugin.yaml stays truthful
-        run: |
-          node -e "
-            const fs = require('fs');
-            const yaml = fs.readFileSync('plugin.yaml', 'utf8');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            const version = yaml.match(/^version:\s*(\S+)/m)[1];
-            if (version !== pkg.version) {
-              console.error('plugin.yaml version', version, '!= package.json', pkg.version);
-              process.exit(1);
-            }
-            if (!/^requires_hermes:\s*">=[0-9]+\.[0-9]+\.[0-9]+"/m.test(yaml)) {
-              console.error('requires_hermes must be a SemVer floor');
-              process.exit(1);
-            }
-            console.log('manifest consistent:', version);
-          "
+        run: node tools/check-manifest.mjs
 
       # Rule 17: everything a reviewer reads at the pin must be source. Running
       # the plugin locally leaves __pycache__ behind; it must never be committed.
@@ -68,15 +53,4 @@ jobs:
       # The self-test ROM is a binary the scanner reads; its provenance lives in
       # the repo. If the bytes change, the golden hash and this check both move.
       - name: Self-test ROM matches its recorded hash
-        run: |
-          node -e "
-            const fs = require('fs');
-            const crypto = require('crypto');
-            const expected = '275705265cc8dd3d6c15bff07b136c2654a42da5a06664116a0800ce96c1dc00';
-            const actual = crypto.createHash('sha256').update(fs.readFileSync('roms/selftest.gb')).digest('hex');
-            if (actual !== expected) {
-              console.error('roms/selftest.gb changed:', actual);
-              process.exit(1);
-            }
-            console.log('selftest.gb sha256 ok');
-          "
+        run: node tools/check-selftest.mjs
