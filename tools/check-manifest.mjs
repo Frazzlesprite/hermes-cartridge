@@ -19,6 +19,17 @@ if (!/^requires_hermes:\s*"[>=]=?[0-9]+\.[0-9]+\.[0-9]+"/m.test(yaml)) {
   problems.push('requires_hermes must be a SemVer floor, quoted')
 }
 
+// A key that ends up indented is no longer a top-level key: YAML folds it into
+// the value above, the loader loses it, and the plugin will not load. That is
+// exactly how `homepage:` shipped inside `license:` once. Assert every required
+// key starts at column 0 rather than trusting the file to look right.
+const TOP_LEVEL = ['name', 'version', 'manifest_version', 'api_version', 'description', 'license', 'homepage', 'requires_hermes']
+for (const key of TOP_LEVEL) {
+  if (!new RegExp(`^${key}:\\s*\\S`, 'm').test(yaml)) {
+    problems.push(`plugin.yaml: "${key}" is missing from column 0 (indented keys do not survive YAML parsing)`)
+  }
+}
+
 // The name and interface are the product surface. A manufacturer mark here is a
 // review failure, not a style nit, so the build refuses it. \s+ rather than \s?
 // so the vendored core's `this.gameboy` identifiers do not trip the check.
@@ -36,4 +47,4 @@ if (problems.length) {
   process.exit(1)
 }
 
-console.log(`manifest consistent: ${version}, no marks in the shipped surface`)
+console.log(`manifest consistent: ${version}, top-level keys intact, no marks in the shipped surface`)

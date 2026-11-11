@@ -347,6 +347,10 @@ export function CartridgePane() {
     // shortcut before the canvas ever sees it, and Start becomes a no-op.
     const onCaptureKeyDown = event => {
       if (!paneFocusRef.current) return
+      // While an approval card is up the game is held anyway, so keys belong to
+      // the card: arrows scroll a long command instead of being swallowed by a
+      // paused console. Answering is a click, so nothing is lost.
+      if (busy.get().approvalPending) return
       const button = buttonForCode(prefs.get().bindings, event.code)
       if (!button) return
       event.preventDefault()
@@ -644,11 +648,24 @@ export function CartridgePane() {
               })
             ]
           }),
-          approval.description || approval.command
+          approval.description
             ? jsx('div', {
-                className: 'mt-1 max-h-16 overflow-hidden text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+                className: 'mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
                 style: { wordBreak: 'break-word' },
-                children: approval.description || approval.command
+                children: approval.description
+              })
+            : null,
+          // The command is what is actually being approved, so it is shown in
+          // full and scrollable. Clipping it let a user approve text they could
+          // not read; showing only the description did the same. Scrolls rather
+          // than truncates, and renders whenever there is a command to read.
+          approval.command
+            ? jsx('pre', {
+                className:
+                  'mt-1 max-h-36 overflow-y-auto rounded bg-black/35 p-1.5 font-mono text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)',
+                style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+                tabIndex: 0,
+                children: approval.command
               })
             : null,
           jsx('div', {

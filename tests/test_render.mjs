@@ -129,3 +129,33 @@ test('the pane renders the empty cartridge slot before a ROM is loaded', () => {
   assert.match(html, /cartridge slot/i, 'the drop zone copy')
   assert.match(html, /Self-test cartridge/i, 'a way in without a file picker')
 })
+
+test('the approval card shows the whole command, not just the description', () => {
+  const { ctx, registrations, events } = fakeContext()
+  plugin.register(ctx)
+
+  // A command long enough to be clipped by a fixed height, and free of
+  // characters React would escape, so the assertion is about the text itself.
+  const command = 'Remove-Item C:/Users/test/approval-probe.txt -Force; Write-Output removed; Get-ChildItem C:/Users/test/approval-probe.txt'
+  const description = 'Windows PowerShell destructive delete'
+
+  const approvalEvent = events.find(e => e.type === 'approval.request')
+  assert.ok(approvalEvent, 'the pane must subscribe to approval requests')
+  approvalEvent.listener({ payload: { kind: 'approval', description, command } })
+
+  const pane = registrations.find(c => c.area === 'panes')
+  const html = renderToString(pane.render())
+
+  assert.match(html, /Hermes needs you/, 'the card is up')
+  assert.match(html, new RegExp(description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the description is still shown')
+
+  // The command must be in the DOM in full. A reviewer should never be asked to
+  // approve text the pane refused to render.
+  assert.ok(html.includes(command), 'the full command is rendered')
+  assert.ok(!html.includes(description + command), 'description and command are separate blocks')
+
+  const pre = html.match(/<pre[^>]*>/)?.[0] ?? ''
+  assert.ok(pre, 'the command sits in its own block')
+  assert.ok(pre.includes('overflow-y-auto'), 'the command block scrolls')
+  assert.ok(!pre.includes('overflow-hidden'), 'the command block must not clip')
+})

@@ -4,7 +4,7 @@ manifest_version: 2
 api_version: 1
 description: A handheld ROM emulator pane that runs while Hermes works and pauses the moment it needs you.
 license: MIT
-  homepage: https://github.com/Frazzlesprite/hermes-cartridge
+homepage: https://github.com/Frazzlesprite/hermes-cartridge
 tags: [desktop, emulator, break, focus]
 requires_hermes: ">=0.23.0"
 config_schema:
