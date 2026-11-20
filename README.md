@@ -20,7 +20,7 @@ instant Hermes needs an approval, resumed on the same frame once you answer.
 - [Settings](#settings)
 - [Architecture](#architecture)
 - [Development](#development)
-- [Known limits in 0.1.0](#known-limits-in-010)
+- [Known limits in 0.1.1](#known-limits-in-011)
 - [Licences and provenance](#licences-and-provenance)
 
 ## Licence
@@ -95,18 +95,21 @@ ln -s /path/to/cartridge-plugin ~/.hermes/plugins/cartridge   # macOS/Linux
 > on-screen deck works regardless of the keyboard.
 
 Keys are captured only while the game itself has focus — click the screen once,
-and the pane says so until you do. The **control deck under the screen** works
-without the keyboard entirely: click or tap the D-pad, select, start, A and B,
-and they light up when pressed. They light up for keyboard presses too, so you
-can see what the keys are doing. The key legend under the buttons always shows
-your current bindings.
+and the pane says so until you do. Clicking anywhere outside the pane, or moving
+focus into a text field (a click in the composer, or Tab), releases it, so typing
+is never swallowed. All bindings are rebindable in
+**Settings → Plugins → Cartridge → Controls**.
 
-Keys are captured only while the pane has focus, and `preventDefault` is applied
-only there, so the composer keeps working normally. All bindings are rebindable
-in **Settings → Plugins → Cartridge → Controls**.
+The **control deck under the screen** works without the keyboard entirely: click
+or tap the D-pad, select, start, A and B, and they light up when pressed. They
+light up for keyboard presses too, so you can see what the keys are doing. The
+key legend under the buttons always shows your current bindings.
 
 The footer gives you mode, quick-save, save slots, mute and a file picker. The
-status chip in the bar shows today's time served; click it to pause or resume.
+save panel shows what is in each slot and when it was written, and carries
+**reset** (power-cycle the cartridge, keeping its battery save) and **eject**.
+The status chip in the bar shows today's time served; click it to pause or
+resume.
 
 ## How the arbitration works
 
@@ -120,12 +123,15 @@ Two modes, one rule each:
 - An approval **pauses immediately**, writes the automatic save slot, and puts
   the request in the pane with the same choices Hermes would offer. Answering it
   restores the slot and carries on from the same frame.
-- When the turn ends the pane stops and shows *the agent is back*. It does not
-  reset, and it does not replay the title screen.
+- When the turn ends (in interrupted mode) the pane stops and shows *the agent is
+  back in this chat*. It does not reset, and it does not replay the title screen.
+  Stopping is a save point too: the pane writes the automatic slot whenever the
+  game stops, and every 30 seconds while it is running, so a restart lands near
+  the last frame rather than at the last approval.
 - **Time served** only counts while frames actually advanced during a turn,
   which is why the number in the chip is honest.
-- A pane that is hidden or scrolled away stops advancing frames. Nothing burns
-  CPU in the background.
+- A pane that is hidden, in an inactive tab, minimised, or scrolled out of the
+  viewport stops advancing frames. Nothing burns CPU in the background.
 
 The state machine is a pure reducer (`src/state/reducer.js`) with no React, no
 emulator and no timers in it, so every transition is unit-tested — including an
@@ -141,24 +147,27 @@ approval arriving mid-turn and a mode flip while one is pending.
 - **Controls** — rebind every button; conflicting keys are refused.
 - **About** — version, core version, palette list and the licence summary.
 
-`plugin.yaml` also declares the same keys in `config_schema`, so the agent-side
-settings form shows them.
+These are the plugin's only settings. `plugin.yaml` deliberately declares no
+`config_schema`: the agent half registers nothing, so an agent-side settings
+form would write values that the pane never reads.
 
 ## Architecture
 
 ```
 desktop/plugin.js        built single-file ESM entry (the app loads this)
 src/
+  ids.js                 plugin and pane ids, shared by the entry and the pane
   plugin.js              registration: pane, chip, palette, settings
   state/reducer.js       busy-state arbitration, pure
   state/store.js         atoms shared by the pane and the chip
   core/adapter.js        the ONLY module that touches the emulator
   core/state-fields.js   save-state field table, derived from upstream
-  pane/                  canvas, frame pacing, commands
+  pane/                  canvas, frame pacing, commands, visibility gate
   input/keymap.js        bindings and focus gating, pure
-  audio/player.js        ring buffer + AudioContext
-  roms/roms.js           file reading, self-test, SHA-256 identity
+  audio/player.js        batched scheduling + AudioContext
+  roms/roms.js           file reading and the bundled self-test
   saves/saves.js         slots and battery saves via ctx.files
+  util/format.js         the strings the user reads, pure
 vendor/jsgbc-core/       pinned MIT core, upstream source included
 roms/                    WTFPL self-test ROM + its source
 tests/                   headless harness
@@ -179,7 +188,7 @@ Two decisions worth knowing about:
 ```bash
 npm install
 npm run build     # src/ -> desktop/plugin.js (+ build/core.node.mjs)
-npm test          # 27 headless tests
+npm test          # 66 headless tests (builds first)
 npm run verify    # build, then test
 ```
 
@@ -195,7 +204,10 @@ The tests that matter most:
 | `test_state_roundtrip.mjs` | a save state replays **identical** frames after a restore |
 | `test_reducer.mjs` | every arbitration transition, approval-during-play included |
 | `test_render.mjs` | every surface mounts with real React — the bug class that a bundle cannot catch |
-| `test_gbc.mjs` | colour mode renders, and a corrupt cartridge header is refused |
+| `test_audio.mjs` | capture is on by default, samples are real, muting stops it |
+| `test_player.mjs` | output is batched, muting is silent, latency stays inside 100 ms |
+| `test_visibility.mjs` | a hidden, inactive or scrolled-away pane stops the frame loop |
+| `test_gbc.mjs` | colour mode renders, a corrupt header is refused and can be force-loaded |
 
 Sanity gates, run against the plugin directory:
 
@@ -204,21 +216,29 @@ hermes plugins doctor . --ci
 hermes plugins validate . --install-deps
 ```
 
-## Known limits in 0.1.0
+## Known limits in 0.1.1
 
 Written down rather than hidden:
 
 - **Audio starts on a click.** Browser autoplay rules; the first click in the
   pane unlocks it. Muting keeps the core running silently.
+- **Restart resume needs the cartridge.** The automatic slot is keyed by the
+  cartridge's SHA-256, so with *Remember the last cartridge* off (the default)
+  you re-drop the same file after a restart to land on that frame. With it on,
+  the pane opens straight into the game.
 - **Save states are refused across core versions.** A state records the core
   version and the cartridge's SHA-256; loading a mismatched one fails loudly
   instead of corrupting your game.
-- **`remember this cartridge` is capped at ~2 MiB** of ROM, because the data
-  door writes text. Larger cartridges still play perfectly; they just are not
-  stored for the next launch.
-- **No link cable, cheats, rewind, fast-forward, shaders, netplay or gamepad.**
 - **Save states do not include the cartridge's battery RAM**; that lives in its
-  own slot and is written when the pane pauses.
+  own slot. Battery RAM is written every five seconds while a game runs and at
+  every stop, so at most a few seconds can be lost to a hard quit.
+- **`remember this cartridge`** is capped by the data door's 4 MiB text limit,
+  which is roughly a 3 MiB ROM. Larger cartridges still play perfectly; they
+  just are not stored for the next launch.
+- **No link cable, cheats, rewind, fast-forward, shaders, netplay or gamepad.**
+- **A cartridge with a stale header checksum is refused by default** and can be
+  loaded with *Load anyway*. That is the intended path for homebrew built with a
+  hand-written header.
 - **Colour compatibility is verified with a colour-flagged self-test**, not
   with a commercial title. If a specific `.gbc` file misbehaves, that is a core
   bug and worth an issue with the file's SHA-256 and mapper.

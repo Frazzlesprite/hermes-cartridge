@@ -2,6 +2,10 @@
 import { host as host3, PANES_AREA } from "@hermes/plugin-sdk";
 import { jsx as jsx3 } from "react/jsx-runtime";
 
+// src/ids.js
+var PLUGIN_ID = "cartridge";
+var PANE_ID = `${PLUGIN_ID}:pane`;
+
 // src/pane/pane.js
 import { host, useValue, cn } from "@hermes/plugin-sdk";
 import { jsx, jsxs } from "react/jsx-runtime";
@@ -11489,7 +11493,7 @@ function createCore(options = {}) {
     lcd: { canvas, context, offscreenCanvas, offscreenContext }
   });
   let audioChunks = [];
-  let audioEnabled = Boolean(options.audio?.context);
+  let audioEnabled = options.audio !== false;
   gb.audioDevice.init = async () => {
   };
   gb.audioDevice.remainingBuffer = () => 0;
@@ -11507,6 +11511,7 @@ function createCore(options = {}) {
   let inputMask = 0;
   let paletteName = DEFAULT_PALETTE;
   let romInfo = null;
+  let romBytes = null;
   let rearmedFrames = 0;
   const syncInput = (mask) => {
     if (mask === inputMask) return;
@@ -11567,20 +11572,25 @@ function createCore(options = {}) {
     get isGBC() {
       return Boolean(gb.cartridge?.useGbcMode);
     },
-    async loadRom(bytes) {
+    async loadRom(bytes, options2 = {}) {
       const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
       if (data.length < 336) {
         throw new Error("That file is too small to be a cartridge.");
       }
       let sum = 0;
       for (let i = 308; i <= 332; i++) sum = sum - data[i] - 1 & 255;
-      if (sum !== data[333]) {
-        throw new Error("That file does not look like a handheld cartridge (header checksum mismatch).");
+      if (!options2.force && sum !== data[333]) {
+        const error = new Error(
+          "That cartridge\u2019s header checksum does not match. It may be a damaged file, or homebrew with a hand-written header."
+        );
+        error.code = "header-checksum";
+        throw error;
       }
       gb.removeCartridge();
       gb.insertCartridge(data);
       boot();
       const sha256 = await sha256Hex(data);
+      romBytes = data;
       romInfo = {
         title: (gb.cartridge.name || "").trim(),
         isGBC: Boolean(gb.cartridge.useGbcMode),
@@ -11592,6 +11602,41 @@ function createCore(options = {}) {
       audioChunks = [];
       applyPalette();
       return romInfo;
+    },
+    /** True while a cartridge is inserted. */
+    get hasCartridge() {
+      return Boolean(gb.cartridge);
+    },
+    /** Remove the cartridge. The caller owns the UI state that goes with it. */
+    eject() {
+      if (!gb.cartridge) return false;
+      gb.removeCartridge();
+      romInfo = null;
+      romBytes = null;
+      inputMask = 0;
+      audioChunks = [];
+      return true;
+    },
+    /**
+     * Power-cycle the current cartridge without losing its save RAM.
+     *
+     * A reset is the escape hatch for a game that has wedged or is sitting on a
+     * title screen you cannot leave. Re-inserting the cartridge builds a fresh
+     * MBC, so the battery RAM is copied across explicitly; the pattern is the
+     * same one `batterySave`/`loadBattery` use.
+     */
+    reset() {
+      if (!romBytes) return false;
+      const ram = gb.cartridge?.mbc?.getRam?.();
+      const keep = ram && ram.length ? Uint8Array.from(ram) : null;
+      gb.removeCartridge();
+      gb.insertCartridge(romBytes);
+      boot();
+      if (keep) gb.cartridge.mbc?.loadRam?.(keep);
+      inputMask = 0;
+      audioChunks = [];
+      applyPalette();
+      return true;
     },
     runFrame() {
       if (!gb.cartridge) return;
@@ -11781,6 +11826,12 @@ function createPacer({ onFrame, shouldRun, frameMs = FRAME_MS }) {
   };
 }
 
+// src/pane/visibility.js
+function computePaneVisible(signals = {}) {
+  const { documentHidden = false, cssVisible = true, intersecting = true } = signals;
+  return !documentHidden && cssVisible && intersecting;
+}
+
 // src/pane/commands.js
 var commands = {
   loadFile: null,
@@ -11789,13 +11840,18 @@ var commands = {
   toggleMode: null,
   togglePlay: null,
   toggleMute: null,
-  openSaves: null
+  openSaves: null,
+  eject: null,
+  reset: null
 };
 function runCommand(name) {
   const fn = commands[name];
   if (typeof fn !== "function") return false;
   fn();
   return true;
+}
+function clearCommands() {
+  for (const key of Object.keys(commands)) commands[key] = null;
 }
 
 // src/audio/player.js
@@ -11805,6 +11861,10 @@ function createAudioPlayer() {
   let enabled = true;
   let nextTime = 0;
   let sampleRate = 44100;
+  let flushFrames = 0;
+  let pendingLeft = null;
+  let pendingRight = null;
+  let pendingFrames = 0;
   const ensure = () => {
     if (context) return context;
     const Ctor = globalThis.AudioContext ?? globalThis.webkitAudioContext;
@@ -11814,6 +11874,35 @@ function createAudioPlayer() {
     gain.gain.value = enabled ? 1 : 0;
     gain.connect(context.destination);
     return context;
+  };
+  const resetBatch = () => {
+    pendingLeft = null;
+    pendingRight = null;
+    pendingFrames = 0;
+    flushFrames = 0;
+  };
+  const ensureBatch = () => {
+    if (pendingLeft) return;
+    flushFrames = Math.max(256, Math.round(sampleRate * 0.05));
+    pendingLeft = new Float32Array(flushFrames);
+    pendingRight = new Float32Array(flushFrames);
+    pendingFrames = 0;
+  };
+  const flush = () => {
+    if (!context || pendingFrames === 0) return;
+    const frames = pendingFrames;
+    const buffer = context.createBuffer(2, frames, sampleRate);
+    buffer.copyToChannel(pendingLeft.subarray(0, frames), 0);
+    buffer.copyToChannel(pendingRight.subarray(0, frames), 1);
+    const now = context.currentTime;
+    if (nextTime < now + 0.01) nextTime = now + 0.03;
+    if (nextTime - now > 0.1) nextTime = now + 0.03;
+    const node = context.createBufferSource();
+    node.buffer = buffer;
+    node.connect(gain);
+    node.start(nextTime);
+    nextTime += buffer.duration;
+    pendingFrames = 0;
   };
   return {
     get latencyMs() {
@@ -11836,35 +11925,40 @@ function createAudioPlayer() {
     setEnabled(on) {
       enabled = Boolean(on);
       if (gain) gain.gain.value = enabled ? 1 : 0;
-      if (!enabled) nextTime = 0;
+      if (!enabled) {
+        nextTime = 0;
+        resetBatch();
+      }
     },
     isEnabled() {
       return enabled;
     },
     setSampleRate(rate) {
-      if (Number.isFinite(rate) && rate > 8e3 && rate < 192e3) sampleRate = Math.round(rate);
+      if (Number.isFinite(rate) && rate > 8e3 && rate < 192e3) {
+        const next = Math.round(rate);
+        if (next !== sampleRate) resetBatch();
+        sampleRate = next;
+      }
     },
     /** @param {Int16Array|null} samples interleaved stereo */
     push(samples) {
       if (!enabled || !samples || samples.length < 2) return;
       const ctx = ensure();
       if (!ctx || ctx.state !== "running") return;
-      const frames = Math.floor(samples.length / 2);
-      const buffer = ctx.createBuffer(2, frames, sampleRate);
-      const left = buffer.getChannelData(0);
-      const right = buffer.getChannelData(1);
-      for (let i = 0, j = 0; i < frames; i++, j += 2) {
-        left[i] = samples[j] / 32768;
-        right[i] = samples[j + 1] / 32768;
+      ensureBatch();
+      const inputFrames = Math.floor(samples.length / 2);
+      let at = 0;
+      while (at < inputFrames) {
+        const take = Math.min(inputFrames - at, flushFrames - pendingFrames);
+        for (let i = 0; i < take; i++) {
+          const s = (at + i) * 2;
+          pendingLeft[pendingFrames + i] = samples[s] / 32768;
+          pendingRight[pendingFrames + i] = samples[s + 1] / 32768;
+        }
+        pendingFrames += take;
+        at += take;
+        if (pendingFrames === flushFrames) flush();
       }
-      const now = ctx.currentTime;
-      if (nextTime < now + 0.01) nextTime = now + 0.03;
-      if (nextTime - now > 0.1) nextTime = now + 0.03;
-      const node = ctx.createBufferSource();
-      node.buffer = buffer;
-      node.connect(gain);
-      node.start(nextTime);
-      nextTime += buffer.duration;
     },
     dispose() {
       try {
@@ -11875,6 +11969,7 @@ function createAudioPlayer() {
       context = null;
       gain = null;
       nextTime = 0;
+      resetBatch();
     }
   };
 }
@@ -11938,6 +12033,34 @@ function createSaveStore(ctx, { onNotice } = {}) {
   return {
     slots(romSha) {
       return readIndex()[romSha] ?? {};
+    },
+    /**
+     * The slot list, reconciled with the disk.
+     *
+     * The index is what makes the panel paint instantly, but it can outlive a
+     * file that was deleted outside the plugin (or a write that never landed).
+     * Stat each slot and drop the ones that are gone, so "load" is never offered
+     * for a file that is not there. If the door errors, keep the index's view
+     * rather than pretending a save has vanished.
+     */
+    async slotsVerified(romSha) {
+      const index = readIndex()[romSha] ?? {};
+      if (!hasFiles(ctx) || typeof ctx.files.stat !== "function") return index;
+      const verified = {};
+      for (const [slot, meta] of Object.entries(index)) {
+        let result = null;
+        try {
+          result = await ctx.files.stat(DATA, fileName(romSha, slot));
+        } catch {
+          result = null;
+        }
+        if (result?.ok && result.exists === false) {
+          forget(romSha, slot);
+          continue;
+        }
+        verified[slot] = result?.ok ? { at: result.mtimeMs ?? meta.at, size: result.size ?? meta.size } : meta;
+      }
+      return verified;
     },
     async write(romSha, slot, bytes) {
       if (!romSha || !bytes) return false;
@@ -12097,6 +12220,8 @@ async function readRomFile(file) {
   if (buffer.byteLength === 0) throw new Error(`\u201C${name}\u201D is empty.`);
   return { bytes: new Uint8Array(buffer), name };
 }
+
+// src/util/format.js
 function displayName(name) {
   if (!name) return "";
   const bare = String(name).split(/[\\/]/).pop() ?? "";
@@ -12107,6 +12232,17 @@ function formatBytes(n) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+function formatAgo(at, now = Date.now()) {
+  const when = Number(at);
+  if (!Number.isFinite(when) || when <= 0) return "empty";
+  const seconds = Math.max(0, Math.floor((now - when) / 1e3));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 // src/state/store.js
@@ -12130,7 +12266,6 @@ function createState(overrides = {}) {
     paneHidden: false,
     status: STATUS.IDLE,
     approval: null,
-    timeServedMs: 0,
     ...overrides
   };
   state.status = derive(state);
@@ -12148,6 +12283,12 @@ function isRunning(state) {
 function needsAttention(state) {
   return state.approvalPending;
 }
+function statusLabel(state) {
+  if (state.status === STATUS.PLAYING) return "playing";
+  if (state.status === STATUS.INTERRUPTED) return "paused \xB7 approval";
+  if (state.status === STATUS.PAUSED_BY_USER) return "paused";
+  return "standby";
+}
 function reduce(prev, action) {
   const next = { ...prev };
   switch (action.type) {
@@ -12158,10 +12299,15 @@ function reduce(prev, action) {
       next.approvalPending = Boolean(action.value);
       next.approval = action.value ? action.approval ?? null : null;
       break;
-    case "approval-cleared":
+    case "approval-cleared": {
+      const onScreen = prev.approval?.prompt_id ?? null;
+      if (action.promptId && onScreen && action.promptId !== onScreen) {
+        return { state: prev, effects: [] };
+      }
       next.approvalPending = false;
       next.approval = null;
       break;
+    }
     case "user-toggle-play":
       next.userPaused = !prev.userPaused;
       break;
@@ -12176,14 +12322,6 @@ function reduce(prev, action) {
       break;
     case "pane-hidden":
       next.paneHidden = Boolean(action.value);
-      break;
-    case "tick":
-      if (prev.status === STATUS.PLAYING && prev.turnBusy && !prev.paneHidden) {
-        next.timeServedMs = prev.timeServedMs + Math.max(0, Number(action.ms) || 0);
-      }
-      break;
-    case "reset-clock":
-      next.timeServedMs = 0;
       break;
     default:
       return { state: prev, effects: [] };
@@ -12249,7 +12387,10 @@ function setPrefs(patch) {
   }
   if (patch.mode) dispatch({ type: "set-mode", value: patch.mode });
   if (patch.palette) worker.core?.setPalette(patch.palette);
-  if (typeof patch.audio === "boolean") worker.player?.setEnabled(patch.audio);
+  if (typeof patch.audio === "boolean") {
+    worker.player?.setEnabled(patch.audio);
+    worker.core?.setAudioEnabled?.(patch.audio);
+  }
   return next;
 }
 function addServed(ms) {
@@ -12299,12 +12440,26 @@ function formatServed(ms) {
 // src/pane/pane.js
 var AUTO_SLOT = "auto";
 var SLOTS = ["1", "2", "3", "4"];
+var AUTO_SAVE_MS = 3e4;
+var BATTERY_SAVE_MS = 5e3;
 var CHOICE_LABELS = {
   once: "Allow once",
   session: "Allow for session",
   always: "Always allow",
   deny: "Deny"
 };
+function isEditable(target) {
+  return Boolean(
+    target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable === true)
+  );
+}
+function sameBytes(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 function scaleFor(preference, width, height) {
   if (preference !== "auto") {
     const fixed = Number.parseInt(preference, 10);
@@ -12336,8 +12491,16 @@ function CartridgePane() {
   const servedRef = useRef(0);
   const noticeTimerRef = useRef(0);
   const effectsBridge = useRef(null);
+  const effectQueue = useRef(Promise.resolve());
+  const pendingFocusReleaseRef = useRef(0);
+  const lastStatusRef = useRef(null);
+  const refusedRef = useRef(null);
+  const lastBatteryRef = useRef(null);
+  const batteryTickRef = useRef(0);
+  const autoSaveTickRef = useRef(0);
   const [scale, setScale] = useState(3);
   const [savesOpen, setSavesOpen] = useState(false);
+  const [slotInfo, setSlotInfo] = useState({});
   const [notice, setNotice] = useState("");
   const [pressed, setPressed] = useState({});
   const [canvasFocused, setCanvasFocused] = useState(false);
@@ -12403,14 +12566,74 @@ function CartridgePane() {
     window.clearTimeout(noticeTimerRef.current);
     noticeTimerRef.current = window.setTimeout(() => setNotice(""), 2600);
   };
-  const bootRom = async (bytes, name) => {
+  function releaseFocus() {
+    paneFocusRef.current = false;
+    setCanvasFocused(false);
+    clearHeld();
+  }
+  async function refreshSlots() {
+    const info = rom.get();
+    const saves = savesRef.current;
+    if (!info || !saves) {
+      setSlotInfo({});
+      return;
+    }
+    setSlotInfo(saves.slots(info.sha256));
+    try {
+      const verified = await saves.slotsVerified(info.sha256);
+      if (rom.get()?.sha256 === info.sha256) setSlotInfo(verified);
+    } catch {
+    }
+  }
+  async function autoSaveNow(reason) {
+    const core = coreRef.current;
+    const info = rom.get();
+    const saves = savesRef.current;
+    if (!core || !info || !saves) return false;
+    try {
+      const ok = await saves.write(info.sha256, AUTO_SLOT, core.saveState());
+      if (ok) {
+        if (reason === "interrupt") flash("Paused for the agent \u2014 frame held");
+        void refreshSlots();
+      }
+      return ok;
+    } catch (saveError) {
+      console.warn("[cartridge] automatic save failed", saveError);
+      return false;
+    }
+  }
+  function bindBatteryFlush(force = false) {
+    const core = coreRef.current;
+    const info = rom.get();
+    const saves = savesRef.current;
+    if (!core || !info?.hasBattery || !saves) return;
+    let battery = null;
+    try {
+      battery = core.batterySave();
+    } catch {
+      return;
+    }
+    if (!battery || battery.length === 0) return;
+    if (!force && sameBytes(lastBatteryRef.current, battery)) return;
+    const snapshot = Uint8Array.from(battery);
+    void saves.write(info.sha256, "battery", battery).then((ok) => {
+      if (ok) lastBatteryRef.current = snapshot;
+    }).catch(() => {
+    });
+  }
+  const bootRom = async (bytes, name, options = {}) => {
     const core = coreRef.current;
     const saves = savesRef.current;
     if (!core) return;
     phase.set("loading");
     lastError.set("");
+    refusedRef.current = null;
     try {
-      const info = await core.loadRom(bytes);
+      if (core.hasCartridge) {
+        bindBatteryFlush(true);
+        await autoSaveNow("switch");
+      }
+      const info = await core.loadRom(bytes, options);
       const loaded = {
         ...info,
         name: name ?? info.title ?? "cartridge",
@@ -12419,7 +12642,11 @@ function CartridgePane() {
       };
       rom.set(loaded);
       core.setPalette(prefs.get().palette);
+      core.setAudioEnabled(prefs.get().audio);
       playerRef.current?.setSampleRate(core.audioSampleRate?.() ?? 44100);
+      playerRef.current?.setEnabled(prefs.get().audio);
+      lastBatteryRef.current = null;
+      void refreshSlots();
       if (info.hasBattery) {
         const battery = await saves.read(info.sha256, "battery");
         if (battery) core.loadBattery(battery);
@@ -12449,13 +12676,20 @@ function CartridgePane() {
     } catch (loadError) {
       phase.set("error");
       lastError.set(loadError?.message ?? String(loadError));
+      refusedRef.current = loadError?.code === "header-checksum" ? { bytes, name } : null;
     }
+  };
+  const forceLoad = () => {
+    const pending = refusedRef.current;
+    if (!pending) return;
+    void bootRom(pending.bytes, pending.name, { force: true });
   };
   const loadFile = async (file) => {
     try {
       const { bytes, name } = await readRomFile(file);
       await bootRom(bytes, name);
     } catch (readError) {
+      refusedRef.current = null;
       phase.set("error");
       lastError.set(readError?.message ?? String(readError));
     }
@@ -12471,6 +12705,7 @@ function CartridgePane() {
     if (!core || !info || !saves) return;
     try {
       const ok = await saves.write(info.sha256, slot, core.saveState());
+      if (ok) void refreshSlots();
       flash(ok ? `Saved to slot ${slot}` : `Could not save to slot ${slot}`);
     } catch (saveError) {
       flash(saveError?.message ?? "Save failed");
@@ -12495,6 +12730,33 @@ function CartridgePane() {
       flash(loadError?.message ?? "Could not load that state");
     }
   };
+  const ejectCartridge = async () => {
+    const core = coreRef.current;
+    const current2 = rom.get();
+    if (!core || !current2) return;
+    bindBatteryFlush(true);
+    await autoSaveNow("eject");
+    core.eject();
+    rom.set(null);
+    phase.set("empty");
+    lastError.set("");
+    refusedRef.current = null;
+    lastBatteryRef.current = null;
+    setSlotInfo({});
+    setSavesOpen(false);
+    clearHeld();
+    flash(`Ejected ${displayName(current2.name)}`);
+  };
+  const resetCartridge = () => {
+    const core = coreRef.current;
+    if (!core?.reset?.()) return;
+    lastBatteryRef.current = null;
+    autoSaveTickRef.current = 0;
+    clearHeld();
+    core.redraw();
+    core.drawTo(context2dRef.current);
+    flash("Cartridge reset");
+  };
   const answerApproval = async (choice) => {
     const approval2 = busy.get().approval;
     if (!approval2) return;
@@ -12504,7 +12766,7 @@ function CartridgePane() {
         ...approval2.prompt_id ? { request_id: approval2.prompt_id } : {},
         ...approval2.session_id ? { session_id: approval2.session_id } : {}
       });
-      dispatch({ type: "approval-cleared" });
+      dispatch({ type: "approval-cleared", promptId: approval2.prompt_id ?? null });
     } catch (respondError) {
       console.warn("[cartridge] approval.respond failed", respondError);
       flash("Answer this one in the chat \u2014 the pane could not reach the approval queue.");
@@ -12519,12 +12781,20 @@ function CartridgePane() {
     const context2d = canvas2.getContext("2d");
     context2dRef.current = context2d;
     core.setPalette(prefs.get().palette);
+    core.setAudioEnabled(prefs.get().audio);
     player.setEnabled(prefs.get().audio);
     worker.core = core;
     worker.player = player;
     worker.saves = saves;
     worker.effects = effects;
-    effects.onEffect = (effect) => void effectsBridge.current?.(effect);
+    if (rom.get() && !core.hasCartridge) {
+      rom.set(null);
+      phase.set("empty");
+      setSlotInfo({});
+    }
+    effects.onEffect = (effect) => {
+      effectQueue.current = effectQueue.current.then(() => effectsBridge.current?.(effect)).catch((error2) => console.warn("[cartridge] effect failed", effect.type, error2));
+    };
     coreRef.current = core;
     playerRef.current = player;
     savesRef.current = saves;
@@ -12538,28 +12808,67 @@ function CartridgePane() {
         if (servedRef.current >= 1e3) {
           const whole = Math.floor(servedRef.current);
           servedRef.current -= whole;
-          const before = busy.get();
-          dispatch({ type: "tick", ms: whole });
-          if (before.turnBusy) addServed(whole);
+          if (busy.get().turnBusy) addServed(whole);
+        }
+        batteryTickRef.current += FRAME_MS;
+        if (batteryTickRef.current >= BATTERY_SAVE_MS) {
+          batteryTickRef.current = 0;
+          bindBatteryFlush();
+        }
+        autoSaveTickRef.current += FRAME_MS;
+        if (autoSaveTickRef.current >= AUTO_SAVE_MS) {
+          autoSaveTickRef.current = 0;
+          void autoSaveNow("periodic");
         }
       },
-      shouldRun: () => isRunning(busy.get()) && Boolean(rom.get())
+      shouldRun: () => phase.get() === "ready" && isRunning(busy.get()) && Boolean(rom.get())
     });
     pacerRef.current = pacer;
     pacer.start();
-    const onBlur = () => clearHeld();
-    const onVisibility = () => {
-      dispatch({ type: "pane-hidden", value: document.visibilityState !== "visible" });
+    const container = containerRef.current;
+    let intersecting = true;
+    let lastHidden = null;
+    let visibilityPoll = 0;
+    const evaluateVisibility = () => {
+      const cssVisible = container?.checkVisibility?.({ checkVisibilityCSS: true, contentVisibilityAuto: true }) ?? true;
+      const visible = computePaneVisible({
+        documentHidden: typeof document !== "undefined" && document.visibilityState !== "visible",
+        cssVisible,
+        intersecting
+      });
+      if (lastHidden !== !visible) {
+        lastHidden = !visible;
+        dispatch({ type: "pane-hidden", value: !visible });
+        if (!visible) bindBatteryFlush();
+      }
     };
+    const observer = container && typeof IntersectionObserver !== "undefined" ? new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.target === container) intersecting = entry.isIntersecting;
+        }
+        evaluateVisibility();
+      },
+      { threshold: 0 }
+    ) : null;
+    observer?.observe(container);
+    const onBlur = () => clearHeld();
+    const onVisibility = () => evaluateVisibility();
     const onCaptureKeyDown = (event) => {
       if (!paneFocusRef.current) return;
       if (busy.get().approvalPending) return;
       const button = buttonForCode(prefs.get().bindings, event.code);
-      if (!button) return;
+      if (!button) {
+        if (isEditable(document.activeElement)) releaseFocus();
+        return;
+      }
+      window.clearTimeout(pendingFocusReleaseRef.current);
       event.preventDefault();
       event.stopPropagation();
       window.setTimeout(() => {
-        if (phase.get() !== "empty") canvasRef.current?.focus();
+        if (phase.get() !== "empty" && !isEditable(document.activeElement)) {
+          canvasRef.current?.focus();
+        }
       }, 0);
       if (event.repeat) return;
       ensurePlayFromInput();
@@ -12575,18 +12884,19 @@ function CartridgePane() {
     };
     const onBeforeInput = (event) => {
       if (!paneFocusRef.current) return;
-      const target = event.target;
-      const editable = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable === true);
-      if (!editable) return;
+      if (!isEditable(event.target)) return;
       event.preventDefault();
       event.stopPropagation();
     };
     const onOutsidePointerDown = (event) => {
       const root = rootRef.current;
       if (!root || root.contains(event.target)) return;
-      paneFocusRef.current = false;
-      setCanvasFocused(false);
-      clearHeld();
+      releaseFocus();
+    };
+    const onPageHide = () => {
+      bindBatteryFlush(true);
+      void autoSaveNow("quit");
+      flushServed();
     };
     window.addEventListener("blur", onBlur);
     window.addEventListener("pointerdown", onOutsidePointerDown, true);
@@ -12594,8 +12904,10 @@ function CartridgePane() {
     window.addEventListener("beforeinput", onBeforeInput, true);
     window.addEventListener("keypress", onBeforeInput, true);
     window.addEventListener("keyup", onCaptureKeyUp, true);
+    window.addEventListener("pagehide", onPageHide);
     document.addEventListener("visibilitychange", onVisibility);
-    onVisibility();
+    evaluateVisibility();
+    visibilityPoll = window.setInterval(evaluateVisibility, 750);
     const remembered = worker.ctx?.storage.get("rom.remembered", null);
     if (remembered) {
       const rememberedName = worker.ctx?.storage.get("rom.rememberedName", "remembered cartridge");
@@ -12606,17 +12918,25 @@ function CartridgePane() {
       });
     }
     return () => {
+      bindBatteryFlush(true);
+      void autoSaveNow("quit");
       pacer.stop();
       player.dispose();
+      observer?.disconnect();
+      window.clearInterval(visibilityPoll);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pointerdown", onOutsidePointerDown, true);
       window.removeEventListener("keydown", onCaptureKeyDown, true);
       window.removeEventListener("beforeinput", onBeforeInput, true);
       window.removeEventListener("keypress", onBeforeInput, true);
       window.removeEventListener("keyup", onCaptureKeyUp, true);
+      window.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibility);
       window.clearTimeout(noticeTimerRef.current);
+      window.clearTimeout(pendingFocusReleaseRef.current);
       flushServed();
       clearHeld();
+      effects.onEffect = null;
       coreRef.current = null;
       pacerRef.current = null;
       playerRef.current = null;
@@ -12633,8 +12953,7 @@ function CartridgePane() {
     const saves = savesRef.current;
     if (!core || !info || !saves) return;
     if (effect.type === "auto-save") {
-      const ok = await saves.write(info.sha256, AUTO_SLOT, core.saveState());
-      if (ok) flash("Paused for the agent \u2014 frame held");
+      await autoSaveNow("interrupt");
     }
     if (effect.type === "auto-restore") {
       const bytes = await saves.read(info.sha256, AUTO_SLOT);
@@ -12674,24 +12993,24 @@ function CartridgePane() {
     commands.togglePlay = () => dispatch({ type: "user-toggle-play" });
     commands.toggleMute = () => setPrefs({ audio: !prefs.get().audio });
     commands.openSaves = () => setSavesOpen((open) => !open);
-    return () => {
-      for (const key of Object.keys(commands)) commands[key] = null;
-    };
+    commands.eject = () => void ejectCartridge();
+    commands.reset = () => resetCartridge();
+    return () => clearCommands();
   }, []);
-  const bindBatteryFlush = () => {
-    const core = coreRef.current;
-    const info = rom.get();
-    const saves = savesRef.current;
-    if (!core || !info?.hasBattery || !saves) return;
-    const battery = core.batterySave();
-    if (battery) void saves.write(info.sha256, "battery", battery);
-  };
   useEffect(() => {
-    if (isRunning(state)) return;
-    bindBatteryFlush();
+    const previous = lastStatusRef.current;
+    lastStatusRef.current = state.status;
+    if (!isRunning(state)) {
+      bindBatteryFlush();
+      if (previous === STATUS.PLAYING && state.status !== STATUS.INTERRUPTED) {
+        void autoSaveNow("stop");
+      }
+    }
   }, [state.status]);
+  useEffect(() => {
+    if (savesOpen) void refreshSlots();
+  }, [savesOpen]);
   const statusTone = state.status === STATUS.PLAYING ? "playing" : state.status === STATUS.INTERRUPTED ? "interrupted" : "idle";
-  const statusLabel = state.status === STATUS.PLAYING ? "playing" : state.status === STATUS.INTERRUPTED ? "paused \xB7 approval" : state.status === STATUS.PAUSED_BY_USER ? "paused" : "standby";
   const onDrop = (event) => {
     event.preventDefault();
     const file = event.dataTransfer?.files?.[0];
@@ -12711,12 +13030,21 @@ function CartridgePane() {
     },
     onBlur: (event) => {
       setCanvasFocused(false);
-      if (!paneFocusRef.current) clearHeld();
-      if (paneFocusRef.current) {
-        window.setTimeout(() => {
-          if (paneFocusRef.current) canvasRef.current?.focus();
-        }, 0);
+      if (!paneFocusRef.current) {
+        clearHeld();
+        return;
       }
+      const target = event.relatedTarget;
+      if (isEditable(target) && !rootRef.current?.contains(target)) {
+        window.clearTimeout(pendingFocusReleaseRef.current);
+        pendingFocusReleaseRef.current = window.setTimeout(() => releaseFocus(), 0);
+        return;
+      }
+      window.setTimeout(() => {
+        if (paneFocusRef.current && !isEditable(document.activeElement)) {
+          canvasRef.current?.focus();
+        }
+      }, 0);
     },
     onClick: () => {
       void playerRef.current?.unlock();
@@ -12766,18 +13094,47 @@ function CartridgePane() {
     ]
   }) : null;
   const errorState = currentPhase === "error" ? jsxs("div", {
-    className: "flex h-full flex-col items-center justify-center gap-2 px-4 text-center",
+    className: "absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 px-4 text-center",
+    // A dialog over a live game needs its own surface: the theme tokens are
+    // translucent, and blurred frames behind the text made the one message
+    // that matters hard to read. Fixed colours on purpose, so it reads the
+    // same in a light or dark theme.
+    style: { background: "rgba(9, 11, 15, 0.94)" },
     children: [
-      jsx("div", { className: "text-sm text-(--ui-text-secondary)", children: "That cartridge did not load" }),
-      jsx("div", { className: "max-w-[26rem] text-xs text-(--ui-text-tertiary)", children: error }),
-      jsx("button", {
-        type: "button",
-        className: "rounded border border-(--ui-stroke-secondary) px-2 py-1 text-xs text-(--ui-text-secondary)",
-        onClick: () => {
-          phase.set(current ? "ready" : "empty");
-          lastError.set("");
-        },
-        children: "Dismiss"
+      jsx("div", {
+        className: "text-sm",
+        style: { color: "rgba(255, 255, 255, 0.94)" },
+        children: "That cartridge did not load"
+      }),
+      jsx("div", {
+        className: "max-w-[26rem] text-xs",
+        style: { color: "rgba(255, 255, 255, 0.64)" },
+        children: error
+      }),
+      jsxs("div", {
+        className: "flex flex-wrap items-center justify-center gap-2",
+        children: [
+          // A stale header checksum is a homebrew problem, not a broken
+          // file, so the user gets the last word on it.
+          refusedRef.current ? jsx("button", {
+            type: "button",
+            className: "rounded border px-2 py-1 text-xs",
+            style: { color: "rgba(255, 255, 255, 0.92)", borderColor: "rgba(255, 255, 255, 0.3)" },
+            onClick: forceLoad,
+            children: "Load anyway"
+          }) : null,
+          jsx("button", {
+            type: "button",
+            className: "rounded border px-2 py-1 text-xs",
+            style: { color: "rgba(255, 255, 255, 0.8)", borderColor: "rgba(255, 255, 255, 0.3)" },
+            onClick: () => {
+              phase.set(current ? "ready" : "empty");
+              lastError.set("");
+              refusedRef.current = null;
+            },
+            children: "Dismiss"
+          })
+        ]
       })
     ]
   }) : null;
@@ -12833,7 +13190,7 @@ function CartridgePane() {
     className: "pointer-events-none absolute inset-x-0 bottom-1 flex justify-center",
     children: jsx("div", {
       className: "rounded bg-(--ui-surface, transparent) px-2 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
-      children: "the agent is back"
+      children: "the agent is back in this chat"
     })
   }) : null;
   const userPausedOverlay = state.status === STATUS.PAUSED_BY_USER ? jsx("div", {
@@ -13048,17 +13405,28 @@ function CartridgePane() {
   const savePanel = savesOpen ? jsxs("div", {
     className: "absolute inset-x-2 top-2 z-10 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-surface, transparent) p-2 shadow-lg",
     children: [
-      jsx("div", {
+      jsxs("div", {
         className: "mb-1 flex items-center justify-between text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
-        children: jsx("span", { children: "save states" })
+        children: [
+          jsx("span", { children: "save states" }),
+          jsx("span", {
+            title: "Written when the game stops and every 30 seconds while it runs",
+            children: slotInfo[AUTO_SLOT] ? `auto \xB7 ${formatAgo(slotInfo[AUTO_SLOT].at)}` : "auto \xB7 not written yet"
+          })
+        ]
       }),
-      ...SLOTS.map(
-        (slot) => jsxs(
+      ...SLOTS.map((slot) => {
+        const meta = slotInfo[slot];
+        return jsxs(
           "div",
           {
             className: "flex items-center justify-between gap-2 py-0.5",
             children: [
               jsx("span", { className: "text-xs text-(--ui-text-tertiary)", children: `slot ${slot}` }),
+              jsx("span", {
+                className: "flex-1 truncate pl-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
+                children: meta ? `${formatAgo(meta.at)} \xB7 ${formatBytes(meta.size)}` : "empty"
+              }),
               jsxs("span", {
                 className: "flex gap-1",
                 children: [
@@ -13070,7 +13438,9 @@ function CartridgePane() {
                   }),
                   jsx("button", {
                     type: "button",
+                    disabled: !meta,
                     className: "rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)",
+                    style: { opacity: meta ? 1 : 0.45 },
                     onClick: () => void readSlot(slot),
                     children: "load"
                   })
@@ -13079,11 +13449,35 @@ function CartridgePane() {
             ]
           },
           slot
-        )
-      ),
-      jsx("div", {
-        className: "mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
-        children: "an automatic slot is written when the agent interrupts"
+        );
+      }),
+      jsxs("div", {
+        className: "mt-1.5 flex items-center justify-between gap-2 border-t border-(--ui-stroke-secondary) pt-1",
+        children: [
+          jsx("span", {
+            className: "text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
+            children: "auto save on every stop, and every 30 s"
+          }),
+          jsxs("span", {
+            className: "flex gap-1",
+            children: [
+              jsx("button", {
+                type: "button",
+                className: "rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)",
+                onClick: resetCartridge,
+                title: "Power-cycle the cartridge, keeping its battery save",
+                children: "reset"
+              }),
+              jsx("button", {
+                type: "button",
+                className: "rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)",
+                onClick: () => void ejectCartridge(),
+                title: "Remove the cartridge",
+                children: "eject"
+              })
+            ]
+          })
+        ]
       })
     ]
   }) : null;
@@ -13101,7 +13495,14 @@ function CartridgePane() {
     onBlur: (event) => {
       if (event.currentTarget.contains(event.relatedTarget)) return;
       setCanvasFocused(false);
-      if (!paneFocusRef.current) clearHeld();
+      if (!paneFocusRef.current) {
+        clearHeld();
+        return;
+      }
+      if (isEditable(event.relatedTarget)) {
+        window.clearTimeout(pendingFocusReleaseRef.current);
+        pendingFocusReleaseRef.current = window.setTimeout(() => releaseFocus(), 0);
+      }
     },
     onDragOver: (event) => event.preventDefault(),
     onDrop,
@@ -13126,7 +13527,7 @@ function CartridgePane() {
           jsxs("div", {
             className: "flex items-center gap-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)",
             children: [
-              jsx("span", { children: statusLabel }),
+              jsx("span", { children: statusLabel(state) }),
               jsx("span", { children: formatServed(servedToday.ms) })
             ]
           })
@@ -13426,7 +13827,7 @@ function registerSettings(ctx) {
         render: () => jsxs2("div", {
           children: [
             jsx2(ListRow, {
-              title: "Cartridge 0.1.0",
+              title: "Cartridge 0.1.1",
               description: "A handheld ROM pane that plays while the agent works and holds the frame when it needs you."
             }),
             jsx2(ListRow, {
@@ -13450,11 +13851,11 @@ function registerSettings(ctx) {
     ]
   });
 }
-function paletteCommand(id, label, keywords, run) {
+function paletteCommand(id, label, keywords, run, extra = {}) {
   return {
     id: `cartridge.${id}`,
     area: PALETTE_AREA,
-    data: { id: `cartridge.${id}`, label, keywords: ["cartridge", "handheld", "rom", ...keywords], run }
+    data: { id: `cartridge.${id}`, label, keywords: ["cartridge", "handheld", "rom", ...keywords], run, ...extra }
   };
 }
 var NOT_OPEN = "Open the Cartridge pane first (it lives on the right).";
@@ -13466,20 +13867,56 @@ function registerPalette(ctx) {
     paletteCommand("selftest", "Cartridge: Load self-test cartridge", ["rom", "test"], () => {
       if (!runCommand("loadSelftest")) host2.notify({ kind: "info", message: NOT_OPEN });
     }),
-    paletteCommand("mode", "Cartridge: Toggle always-on mode", ["mode", "pause", "interrupt"], () => {
-      if (!runCommand("toggleMode")) dispatch({ type: "mode-toggle" });
-      host2.notify({ kind: "info", message: `Cartridge is ${modeLabel(busy.get().mode)}.` });
-    }),
-    paletteCommand("play", "Cartridge: Pause or resume", ["pause", "resume", "play"], () => {
-      if (!runCommand("togglePlay")) dispatch({ type: "user-toggle-play" });
-    }),
-    paletteCommand("mute", "Cartridge: Mute or unmute", ["audio", "mute", "sound"], () => {
-      if (!runCommand("toggleMute")) setPrefs({ audio: !prefs.get().audio });
-      host2.notify({ kind: "info", message: prefs.get().audio ? "Cartridge audio on." : "Cartridge muted." });
-    }),
+    paletteCommand(
+      "mode",
+      "Cartridge: Toggle always-on mode",
+      ["mode", "pause", "interrupt"],
+      () => {
+        if (!runCommand("toggleMode")) dispatch({ type: "mode-toggle" });
+        host2.notify({ kind: "info", message: `Cartridge is ${modeLabel(busy.get().mode)}.` });
+      },
+      { detail: () => modeLabel(busy.get().mode), detailVariant: "state", keepOpen: true }
+    ),
+    paletteCommand(
+      "play",
+      "Cartridge: Pause or resume",
+      ["pause", "resume", "play"],
+      () => {
+        if (!runCommand("togglePlay")) dispatch({ type: "user-toggle-play" });
+      },
+      { detail: () => statusLabel(busy.get()), detailVariant: "state", keepOpen: true }
+    ),
+    paletteCommand(
+      "mute",
+      "Cartridge: Mute or unmute",
+      ["audio", "mute", "sound"],
+      () => {
+        if (!runCommand("toggleMute")) setPrefs({ audio: !prefs.get().audio });
+        host2.notify({ kind: "info", message: prefs.get().audio ? "Cartridge audio on." : "Cartridge muted." });
+      },
+      { detail: () => prefs.get().audio ? "on" : "muted", detailVariant: "state", keepOpen: true }
+    ),
     paletteCommand("save", "Cartridge: Save state to slot 1", ["save", "state"], () => {
       if (!runCommand("saveSlot")) host2.notify({ kind: "info", message: NOT_OPEN });
-    })
+    }),
+    paletteCommand(
+      "reset",
+      "Cartridge: Reset cartridge",
+      ["reset", "restart", "power"],
+      () => {
+        if (!runCommand("reset")) host2.notify({ kind: "info", message: NOT_OPEN });
+      },
+      { detail: () => rom.get() ? displayName(rom.get().name) : "no cartridge" }
+    ),
+    paletteCommand(
+      "eject",
+      "Cartridge: Eject cartridge",
+      ["eject", "remove", "close"],
+      () => {
+        if (!runCommand("eject")) host2.notify({ kind: "info", message: NOT_OPEN });
+      },
+      { detail: () => rom.get() ? displayName(rom.get().name) : "empty slot" }
+    )
   ]);
 }
 function registerStatusChip(ctx) {
@@ -13492,8 +13929,6 @@ function registerStatusChip(ctx) {
 }
 
 // src/plugin.js
-var PLUGIN_ID = "cartridge";
-var PANE_ID = `${PLUGIN_ID}:pane`;
 var plugin_default = {
   id: PLUGIN_ID,
   name: "Cartridge",
@@ -13509,7 +13944,7 @@ var plugin_default = {
       const approval = { ...prompt, session_id: event?.session_id ?? null };
       dispatch({ type: "approval", value: true, approval });
       try {
-        const visible = typeof host3.paneVisibility === "function" ? host3.paneVisibility(PANE_ID).get() : true;
+        const visible = (typeof host3.paneVisibility === "function" ? host3.paneVisibility(PANE_ID).get() : true) && globalThis.document?.visibilityState !== "hidden";
         if (!visible) {
           ctx.os?.notify?.({
             title: "Hermes needs an approval",
@@ -13519,7 +13954,10 @@ var plugin_default = {
       } catch {
       }
     });
-    ctx.onEvent("approval.settled", () => dispatch({ type: "approval-cleared" }));
+    const settle = (event) => {
+      dispatch({ type: "approval-cleared", promptId: event?.payload?.prompt_id ?? null });
+    };
+    ctx.onEvent("approval.settled", settle);
     ctx.onEvent("clarify.request", (event) => {
       dispatch({
         type: "approval",
@@ -13527,7 +13965,7 @@ var plugin_default = {
         approval: { ...event?.payload ?? {}, session_id: event?.session_id ?? null, kind: "clarify" }
       });
     });
-    ctx.onEvent("clarify.settled", () => dispatch({ type: "approval-cleared" }));
+    ctx.onEvent("clarify.settled", settle);
     ctx.register({
       id: "pane",
       area: PANES_AREA,

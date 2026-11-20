@@ -210,8 +210,13 @@ export function createCore(options = {}) {
   // The core's AudioDevice wants an AudioContext + AudioWorklet at init(). We
   // capture its mixer output instead: `writeAudio` is the only seam the audio
   // controller uses to hand samples out.
+  //
+  // Capture is ON unless told otherwise. It used to key off `options.audio`,
+  // but the pane constructs `createCore()` with no options, so no sample was
+  // ever produced and the whole audio path was silent. Muting belongs to the
+  // player's gain (and setAudioEnabled stops the copying when asked).
   let audioChunks = []
-  let audioEnabled = Boolean(options.audio?.context)
+  let audioEnabled = options.audio !== false
   gb.audioDevice.init = async () => {}
   gb.audioDevice.remainingBuffer = () => 0
   gb.audioDevice.setVolume = () => {}
@@ -237,6 +242,9 @@ export function createCore(options = {}) {
   let inputMask = 0
   let paletteName = DEFAULT_PALETTE
   let romInfo = null
+  // The bytes the live cartridge was built from. Kept so `reset()` can power-
+  // cycle the same cartridge without the pane having to hold a copy.
+  let romBytes = null
   // Frames whose gate had to be re-armed (see runFrame). Exposed so a regression
   // test can prove the recovery path runs instead of the core wedging.
   let rearmedFrames = 0
@@ -325,17 +333,25 @@ export function createCore(options = {}) {
       return Boolean(gb.cartridge?.useGbcMode)
     },
 
-    async loadRom(bytes) {
+    async loadRom(bytes, options = {}) {
       const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
       if (data.length < 0x150) {
         throw new Error('That file is too small to be a cartridge.')
       }
       // A GB cartridge header carries its own checksum at 0x14D. A mismatched
-      // header almost always means "this is a zip, not a ROM".
+      // header almost always means "this is a zip, not a ROM" — but it is also
+      // what a hand-written homebrew header looks like, so the refusal is
+      // overridable: the pane offers "Load anyway" and calls back with
+      // `{ force: true }`. The error carries a code so the caller can tell this
+      // apart from a truncated file.
       let sum = 0
       for (let i = 0x134; i <= 0x14c; i++) sum = (sum - data[i] - 1) & 0xff
-      if (sum !== data[0x14d]) {
-        throw new Error('That file does not look like a handheld cartridge (header checksum mismatch).')
+      if (!options.force && sum !== data[0x14d]) {
+        const error = new Error(
+          'That cartridge’s header checksum does not match. It may be a damaged file, or homebrew with a hand-written header.'
+        )
+        error.code = 'header-checksum'
+        throw error
       }
 
       gb.removeCartridge()
@@ -343,6 +359,7 @@ export function createCore(options = {}) {
       boot()
 
       const sha256 = await sha256Hex(data)
+      romBytes = data
       romInfo = {
         title: (gb.cartridge.name || '').trim(),
         isGBC: Boolean(gb.cartridge.useGbcMode),
@@ -354,6 +371,44 @@ export function createCore(options = {}) {
       audioChunks = []
       applyPalette()
       return romInfo
+    },
+
+    /** True while a cartridge is inserted. */
+    get hasCartridge() {
+      return Boolean(gb.cartridge)
+    },
+
+    /** Remove the cartridge. The caller owns the UI state that goes with it. */
+    eject() {
+      if (!gb.cartridge) return false
+      gb.removeCartridge()
+      romInfo = null
+      romBytes = null
+      inputMask = 0
+      audioChunks = []
+      return true
+    },
+
+    /**
+     * Power-cycle the current cartridge without losing its save RAM.
+     *
+     * A reset is the escape hatch for a game that has wedged or is sitting on a
+     * title screen you cannot leave. Re-inserting the cartridge builds a fresh
+     * MBC, so the battery RAM is copied across explicitly; the pattern is the
+     * same one `batterySave`/`loadBattery` use.
+     */
+    reset() {
+      if (!romBytes) return false
+      const ram = gb.cartridge?.mbc?.getRam?.()
+      const keep = ram && ram.length ? Uint8Array.from(ram) : null
+      gb.removeCartridge()
+      gb.insertCartridge(romBytes)
+      boot()
+      if (keep) gb.cartridge.mbc?.loadRam?.(keep)
+      inputMask = 0
+      audioChunks = []
+      applyPalette()
+      return true
     },
 
     runFrame() {

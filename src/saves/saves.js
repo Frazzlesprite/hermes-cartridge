@@ -82,6 +82,37 @@ export function createSaveStore(ctx, { onNotice } = {}) {
       return readIndex()[romSha] ?? {}
     },
 
+    /**
+     * The slot list, reconciled with the disk.
+     *
+     * The index is what makes the panel paint instantly, but it can outlive a
+     * file that was deleted outside the plugin (or a write that never landed).
+     * Stat each slot and drop the ones that are gone, so "load" is never offered
+     * for a file that is not there. If the door errors, keep the index's view
+     * rather than pretending a save has vanished.
+     */
+    async slotsVerified(romSha) {
+      const index = readIndex()[romSha] ?? {}
+      if (!hasFiles(ctx) || typeof ctx.files.stat !== 'function') return index
+      const verified = {}
+      for (const [slot, meta] of Object.entries(index)) {
+        let result = null
+        try {
+          result = await ctx.files.stat(DATA, fileName(romSha, slot))
+        } catch {
+          result = null
+        }
+        if (result?.ok && result.exists === false) {
+          forget(romSha, slot)
+          continue
+        }
+        verified[slot] = result?.ok
+          ? { at: result.mtimeMs ?? meta.at, size: result.size ?? meta.size }
+          : meta
+      }
+      return verified
+    },
+
     async write(romSha, slot, bytes) {
       if (!romSha || !bytes) return false
       const text = encode(bytes)

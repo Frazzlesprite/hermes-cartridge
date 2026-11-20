@@ -10,7 +10,9 @@ export const commands = {
   toggleMode: null,
   togglePlay: null,
   toggleMute: null,
-  openSaves: null
+  openSaves: null,
+  eject: null,
+  reset: null
 }
 
 export function runCommand(name) {

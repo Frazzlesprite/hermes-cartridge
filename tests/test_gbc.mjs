@@ -63,8 +63,77 @@ test('a cartridge with a broken header is refused, not half-loaded', async () =>
   bytes[0x14d] = bytes[0x14d] ^ 0xff // corrupt the header checksum
 
   const core = createCore()
-  await assert.rejects(() => core.loadRom(bytes), /header checksum/i)
+  await assert.rejects(() => core.loadRom(bytes), error => {
+    assert.match(error.message, /checksum/i)
+    assert.equal(error.code, 'header-checksum', 'the pane keys its override off this code')
+    return true
+  })
 })
+
+test('a broken header can be force-loaded on request', async () => {
+  // Hand-written homebrew headers are stale, not broken. The refusal must stay
+  // overridable or the plugin refuses the exact cartridges it exists to play.
+  const bytes = new Uint8Array(readFileSync(romPath))
+  bytes[0x14d] = bytes[0x14d] ^ 0xff
+
+  const core = createCore()
+  await assert.rejects(() => core.loadRom(bytes), /checksum/i)
+
+  const info = await core.loadRom(bytes, { force: true })
+  assert.equal(info.isGBC, false)
+  for (let frame = 0; frame < 12; frame++) core.runFrame()
+  assert.equal(core.framebufferRGBA().length, SCREEN_WIDTH * SCREEN_HEIGHT * 4)
+})
+
+test('reset power-cycles the cartridge it already has', async () => {
+  const core = createCore()
+  await core.loadRom(new Uint8Array(readFileSync(romPath)))
+  for (let frame = 0; frame < 20; frame++) core.runFrame()
+
+  assert.equal(core.reset(), true, 'reset should report that it ran')
+  assert.equal(core.hasCartridge, true, 'the cartridge stays inserted')
+  for (let frame = 0; frame < 12; frame++) core.runFrame()
+  assert.equal(distinctColours(core.framebufferRGBA()), 4, 'the screen comes back')
+})
+
+test('reset keeps the battery RAM that belongs to the cartridge', async () => {
+  // The self-test ROM has no save RAM, so declare MBC1+RAM+BATTERY and an 8 KiB
+  // SRAM bank in its header. The code is unchanged; the mapper now has a battery.
+  const bytes = new Uint8Array(readFileSync(romPath))
+  bytes[0x147] = 0x03 // MBC1 + RAM + BATTERY
+  bytes[0x149] = 0x02 // 8 KiB
+  bytes[0x14d] = headerChecksum(bytes)
+
+  const core = createCore()
+  const info = await core.loadRom(bytes)
+  assert.equal(info.hasBattery, true)
+
+  core.core.cartridge.mbc.ram[0] = 0x5a
+  core.core.cartridge.mbc.ram[1] = 0xa5
+  const saved = core.batterySave()
+  assert.equal(saved.length, 0x2000)
+  assert.deepEqual([saved[0], saved[1]], [0x5a, 0xa5])
+
+  core.reset()
+  assert.deepEqual(
+    [core.core.cartridge.mbc.ram[0], core.core.cartridge.mbc.ram[1]],
+    [0x5a, 0xa5],
+    'a reset must not wipe the save the cartridge is holding'
+  )
+})
+
+test('eject removes the cartridge and the frame loop stops cleanly', async () => {
+  const core = createCore()
+  await core.loadRom(new Uint8Array(readFileSync(romPath)))
+  core.runFrame()
+
+  assert.equal(core.eject(), true)
+  assert.equal(core.hasCartridge, false)
+  assert.equal(core.reset(), false, 'nothing to power-cycle after an eject')
+  assert.doesNotThrow(() => core.runFrame(), 'a frame request with no cartridge is a no-op')
+  assert.equal(core.drawTo({ putImageData: () => { throw new Error('drew with no cartridge') } }), false)
+})
+
 
 test('a truncated file is refused before it reaches the core', async () => {
   const core = createCore()

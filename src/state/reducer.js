@@ -26,7 +26,6 @@ export function createState(overrides = {}) {
     paneHidden: false,
     status: STATUS.IDLE,
     approval: null,
-    timeServedMs: 0,
     ...overrides
   }
   // `status` is always derived, never supplied.
@@ -56,6 +55,14 @@ export function needsAttention(state) {
   return state.approvalPending
 }
 
+/** The word the pane, the chip and the palette all use for a status. */
+export function statusLabel(state) {
+  if (state.status === STATUS.PLAYING) return 'playing'
+  if (state.status === STATUS.INTERRUPTED) return 'paused · approval'
+  if (state.status === STATUS.PAUSED_BY_USER) return 'paused'
+  return 'standby'
+}
+
 /**
  * @returns {{ state: object, effects: Array<{type: string, [k: string]: any}> }}
  */
@@ -72,10 +79,17 @@ export function reduce(prev, action) {
       next.approval = action.value ? action.approval ?? null : null
       break
 
-    case 'approval-cleared':
+    case 'approval-cleared': {
+      // A settle event belongs to one prompt. If a different prompt is on
+      // screen (two approvals in flight), this one says nothing about it.
+      const onScreen = prev.approval?.prompt_id ?? null
+      if (action.promptId && onScreen && action.promptId !== onScreen) {
+        return { state: prev, effects: [] }
+      }
       next.approvalPending = false
       next.approval = null
       break
+    }
 
     case 'user-toggle-play':
       next.userPaused = !prev.userPaused
@@ -95,18 +109,6 @@ export function reduce(prev, action) {
 
     case 'pane-hidden':
       next.paneHidden = Boolean(action.value)
-      break
-
-    case 'tick':
-      // Time served accrues only while actually playing during a turn
-      // (spec §13.3), so "11m 20s played while the agent worked" is honest.
-      if (prev.status === STATUS.PLAYING && prev.turnBusy && !prev.paneHidden) {
-        next.timeServedMs = prev.timeServedMs + Math.max(0, Number(action.ms) || 0)
-      }
-      break
-
-    case 'reset-clock':
-      next.timeServedMs = 0
       break
 
     default:

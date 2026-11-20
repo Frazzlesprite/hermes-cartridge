@@ -1,9 +1,8 @@
 /**
  * Keyboard mapping (spec §11). Pure: given a bindings map and a KeyboardEvent
  * code, answer "which button?". The pane owns focus and preventDefault; this
- * module never touches the DOM.
+ * module never touches the DOM and imports nothing from the emulator.
  */
-import { BUTTON } from '../core/adapter.js'
 
 export const DEFAULT_BINDINGS = {
   UP: 'ArrowUp',
@@ -32,25 +31,6 @@ export const BUTTON_LABELS = {
   SELECT: 'Select'
 }
 
-/**
- * Codes that scroll the composer or the window. Only swallowed while the pane
- * itself has focus, or the chat input stops working (spec §2.6).
- */
-const SWALLOWED = new Set([
-  'ArrowUp',
-  'ArrowDown',
-  'ArrowLeft',
-  'ArrowRight',
-  'Space',
-  'Enter',
-  'ShiftLeft',
-  'ShiftRight'
-])
-
-export function shouldPreventDefault(code) {
-  return SWALLOWED.has(code)
-}
-
 /** `ShiftLeft` in the map also answers to the right shift key. */
 function codesFor(binding) {
   if (binding === 'ShiftLeft') return ['ShiftLeft', 'ShiftRight']
@@ -62,11 +42,6 @@ export function buttonForCode(bindings, code) {
     if (codesFor(bindings[button]).includes(code)) return button
   }
   return null
-}
-
-export function maskForCode(bindings, code) {
-  const button = buttonForCode(bindings, code)
-  return button ? BUTTON[button] : 0
 }
 
 /** Human label for a KeyboardEvent code, for the rebinding UI. */

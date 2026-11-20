@@ -17,11 +17,11 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 import { useRef, useState } from 'react'
 
 import { busy, rom, served, prefs, setPrefs, formatServed, dispatch, worker } from '../state/store.js'
-import { STATUS, MODE_ALWAYS } from '../state/reducer.js'
+import { STATUS, MODE_ALWAYS, statusLabel } from '../state/reducer.js'
 import { BUTTON_ORDER, BUTTON_LABELS, labelForCode, conflictFor } from '../input/keymap.js'
 import { PALETTES } from '../core/adapter.js'
-import { displayName, formatBytes } from '../roms/roms.js'
-import { runCommand, commands } from '../pane/commands.js'
+import { displayName, formatBytes } from '../util/format.js'
+import { runCommand } from '../pane/commands.js'
 
 const MODE_OPTIONS = [
   { id: 'interrupted', label: 'Interrupted' },
@@ -264,7 +264,7 @@ export function registerSettings(ctx) {
           jsxs('div', {
             children: [
               jsx(ListRow, {
-                title: 'Cartridge 0.1.0',
+                title: 'Cartridge 0.1.1',
                 description:
                   'A handheld ROM pane that plays while the agent works and holds the frame when it needs you.'
               }),
@@ -291,11 +291,11 @@ export function registerSettings(ctx) {
   })
 }
 
-function paletteCommand(id, label, keywords, run) {
+function paletteCommand(id, label, keywords, run, extra = {}) {
   return {
     id: `cartridge.${id}`,
     area: PALETTE_AREA,
-    data: { id: `cartridge.${id}`, label, keywords: ['cartridge', 'handheld', 'rom', ...keywords], run }
+    data: { id: `cartridge.${id}`, label, keywords: ['cartridge', 'handheld', 'rom', ...keywords], run, ...extra }
   }
 }
 
@@ -309,20 +309,56 @@ export function registerPalette(ctx) {
     paletteCommand('selftest', 'Cartridge: Load self-test cartridge', ['rom', 'test'], () => {
       if (!runCommand('loadSelftest')) host.notify({ kind: 'info', message: NOT_OPEN })
     }),
-    paletteCommand('mode', 'Cartridge: Toggle always-on mode', ['mode', 'pause', 'interrupt'], () => {
-      if (!runCommand('toggleMode')) dispatch({ type: 'mode-toggle' })
-      host.notify({ kind: 'info', message: `Cartridge is ${modeLabel(busy.get().mode)}.` })
-    }),
-    paletteCommand('play', 'Cartridge: Pause or resume', ['pause', 'resume', 'play'], () => {
-      if (!runCommand('togglePlay')) dispatch({ type: 'user-toggle-play' })
-    }),
-    paletteCommand('mute', 'Cartridge: Mute or unmute', ['audio', 'mute', 'sound'], () => {
-      if (!runCommand('toggleMute')) setPrefs({ audio: !prefs.get().audio })
-      host.notify({ kind: 'info', message: prefs.get().audio ? 'Cartridge audio on.' : 'Cartridge muted.' })
-    }),
+    paletteCommand(
+      'mode',
+      'Cartridge: Toggle always-on mode',
+      ['mode', 'pause', 'interrupt'],
+      () => {
+        if (!runCommand('toggleMode')) dispatch({ type: 'mode-toggle' })
+        host.notify({ kind: 'info', message: `Cartridge is ${modeLabel(busy.get().mode)}.` })
+      },
+      { detail: () => modeLabel(busy.get().mode), detailVariant: 'state', keepOpen: true }
+    ),
+    paletteCommand(
+      'play',
+      'Cartridge: Pause or resume',
+      ['pause', 'resume', 'play'],
+      () => {
+        if (!runCommand('togglePlay')) dispatch({ type: 'user-toggle-play' })
+      },
+      { detail: () => statusLabel(busy.get()), detailVariant: 'state', keepOpen: true }
+    ),
+    paletteCommand(
+      'mute',
+      'Cartridge: Mute or unmute',
+      ['audio', 'mute', 'sound'],
+      () => {
+        if (!runCommand('toggleMute')) setPrefs({ audio: !prefs.get().audio })
+        host.notify({ kind: 'info', message: prefs.get().audio ? 'Cartridge audio on.' : 'Cartridge muted.' })
+      },
+      { detail: () => (prefs.get().audio ? 'on' : 'muted'), detailVariant: 'state', keepOpen: true }
+    ),
     paletteCommand('save', 'Cartridge: Save state to slot 1', ['save', 'state'], () => {
       if (!runCommand('saveSlot')) host.notify({ kind: 'info', message: NOT_OPEN })
-    })
+    }),
+    paletteCommand(
+      'reset',
+      'Cartridge: Reset cartridge',
+      ['reset', 'restart', 'power'],
+      () => {
+        if (!runCommand('reset')) host.notify({ kind: 'info', message: NOT_OPEN })
+      },
+      { detail: () => (rom.get() ? displayName(rom.get().name) : 'no cartridge') }
+    ),
+    paletteCommand(
+      'eject',
+      'Cartridge: Eject cartridge',
+      ['eject', 'remove', 'close'],
+      () => {
+        if (!runCommand('eject')) host.notify({ kind: 'info', message: NOT_OPEN })
+      },
+      { detail: () => (rom.get() ? displayName(rom.get().name) : 'empty slot') }
+    )
   ])
 }
 

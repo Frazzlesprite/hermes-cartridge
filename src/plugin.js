@@ -9,12 +9,10 @@
 import { host, PANES_AREA } from '@hermes/plugin-sdk'
 import { jsx } from 'react/jsx-runtime'
 
+import { PLUGIN_ID, PANE_ID } from './ids.js'
 import { CartridgePane } from './pane/pane.js'
 import { registerPalette, registerSettings, registerStatusChip } from './menu/surfaces.js'
 import { hydrate, dispatch, flushServed } from './state/store.js'
-
-const PLUGIN_ID = 'cartridge'
-const PANE_ID = `${PLUGIN_ID}:pane`
 
 export default {
   id: PLUGIN_ID,
@@ -42,9 +40,12 @@ export default {
       dispatch({ type: 'approval', value: true, approval })
 
       // Only interrupt the OS when the pane cannot be seen; otherwise the card
-      // in the pane is the notification.
+      // in the pane is the notification. Two signals, because paneVisibility
+      // alone has been seen to answer false for a pane that is on screen.
       try {
-        const visible = typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID).get() : true
+        const visible =
+          (typeof host.paneVisibility === 'function' ? host.paneVisibility(PANE_ID).get() : true) &&
+          globalThis.document?.visibilityState !== 'hidden'
         if (!visible) {
           ctx.os?.notify?.({
             title: 'Hermes needs an approval',
@@ -56,7 +57,12 @@ export default {
       }
     })
 
-    ctx.onEvent('approval.settled', () => dispatch({ type: 'approval-cleared' }))
+    // A settle belongs to one prompt. Passing its id lets the reducer ignore a
+    // second prompt's settlement while the first card is still on screen.
+    const settle = event => {
+      dispatch({ type: 'approval-cleared', promptId: event?.payload?.prompt_id ?? null })
+    }
+    ctx.onEvent('approval.settled', settle)
     // A clarify prompt is not an approval, but it is still "the agent needs
     // you". Pause on it without pretending it can be answered from the pane.
     ctx.onEvent('clarify.request', event => {
@@ -66,7 +72,7 @@ export default {
         approval: { ...(event?.payload ?? {}), session_id: event?.session_id ?? null, kind: 'clarify' }
       })
     })
-    ctx.onEvent('clarify.settled', () => dispatch({ type: 'approval-cleared' }))
+    ctx.onEvent('clarify.settled', settle)
 
     // --- surfaces --------------------------------------------------------
     ctx.register({

@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from 'react'
 
 import { createCore, SCREEN_WIDTH, SCREEN_HEIGHT, BUTTON } from '../core/adapter.js'
 import { createPacer, FRAME_MS } from './loop.js'
-import { commands } from './commands.js'
+import { computePaneVisible } from './visibility.js'
+import { commands, clearCommands } from './commands.js'
 import { createAudioPlayer } from '../audio/player.js'
 import { createSaveStore } from '../saves/saves.js'
 import { buttonForCode, BUTTON_LABELS, labelForCode } from '../input/keymap.js'
-import { readRomFile, selftestRom, displayName } from '../roms/roms.js'
+import { readRomFile, selftestRom } from '../roms/roms.js'
+import { displayName, formatAgo, formatBytes } from '../util/format.js'
 import {
   busy,
   rom,
@@ -24,16 +26,45 @@ import {
   setPrefs,
   effects as effectBridge
 } from '../state/store.js'
-import { STATUS, MODE_ALWAYS, MODE_INTERRUPTED, isRunning, needsAttention } from '../state/reducer.js'
+import {
+  STATUS,
+  MODE_ALWAYS,
+  MODE_INTERRUPTED,
+  isRunning,
+  needsAttention,
+  statusLabel
+} from '../state/reducer.js'
 
 const AUTO_SLOT = 'auto'
 const SLOTS = ['1', '2', '3', '4']
+
+/** How often the automatic slot is written while a game is running. */
+const AUTO_SAVE_MS = 30000
+/** How often battery RAM is compared and, when it moved, written out. */
+const BATTERY_SAVE_MS = 5000
 
 const CHOICE_LABELS = {
   once: 'Allow once',
   session: 'Allow for session',
   always: 'Always allow',
   deny: 'Deny'
+}
+
+/** Is this element somewhere a user types? */
+function isEditable(target) {
+  return Boolean(
+    target &&
+      (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable === true)
+  )
+}
+
+/** Byte compare, for "has the battery RAM actually changed since we wrote it". */
+function sameBytes(a, b) {
+  if (!a || !b || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
 }
 
 function scaleFor(preference, width, height) {
@@ -74,8 +105,22 @@ export function CartridgePane() {
   const servedRef = useRef(0)
   const noticeTimerRef = useRef(0)
   const effectsBridge = useRef(null)
+  const effectQueue = useRef(Promise.resolve())
+  // Focus moved into a composer: release the keyboard lock at the end of the
+  // task unless a bound key's handler vetoes it (see onCanvasBlur).
+  const pendingFocusReleaseRef = useRef(0)
+  const lastStatusRef = useRef(null)
+  // The bytes and name of a cartridge whose header was refused, so the error
+  // card can offer "Load anyway".
+  const refusedRef = useRef(null)
+  // Last battery image written, so a 5 s poll does not rewrite 32 KiB of RAM
+  // that has not moved.
+  const lastBatteryRef = useRef(null)
+  const batteryTickRef = useRef(0)
+  const autoSaveTickRef = useRef(0)
   const [scale, setScale] = useState(3)
   const [savesOpen, setSavesOpen] = useState(false)
+  const [slotInfo, setSlotInfo] = useState({})
   const [notice, setNotice] = useState('')
   const [pressed, setPressed] = useState({})
   const [canvasFocused, setCanvasFocused] = useState(false)
@@ -162,15 +207,110 @@ export function CartridgePane() {
     noticeTimerRef.current = window.setTimeout(() => setNotice(''), 2600)
   }
 
+  /** Give the keyboard back to the rest of the app. */
+  function releaseFocus() {
+    paneFocusRef.current = false
+    setCanvasFocused(false)
+    clearHeld()
+  }
+
+  // --- saves -------------------------------------------------------------
+  /**
+   * The slot index for this cartridge, refreshed whenever the panel opens.
+   *
+   * Paints from the index immediately, then reconciles with the disk: a save
+   * whose file is gone must not sit in the list offering a "load" that fails.
+   */
+  async function refreshSlots() {
+    const info = rom.get()
+    const saves = savesRef.current
+    if (!info || !saves) {
+      setSlotInfo({})
+      return
+    }
+    setSlotInfo(saves.slots(info.sha256))
+    try {
+      const verified = await saves.slotsVerified(info.sha256)
+      // The cartridge may have changed while we were asking the disk.
+      if (rom.get()?.sha256 === info.sha256) setSlotInfo(verified)
+    } catch {
+      /* keep the index view */
+    }
+  }
+
+  /**
+   * Hold the current frame in the automatic slot.
+   *
+   * Written on an interrupt, whenever the game stops (turn end, user pause,
+   * eject) and every 30 s of play, so "quit and reopen" lands near where you
+   * left rather than at the last approval.
+   */
+  async function autoSaveNow(reason) {
+    const core = coreRef.current
+    const info = rom.get()
+    const saves = savesRef.current
+    if (!core || !info || !saves) return false
+    try {
+      const ok = await saves.write(info.sha256, AUTO_SLOT, core.saveState())
+      if (ok) {
+        if (reason === 'interrupt') flash('Paused for the agent — frame held')
+        void refreshSlots()
+      }
+      return ok
+    } catch (saveError) {
+      console.warn('[cartridge] automatic save failed', saveError)
+      return false
+    }
+  }
+
+  /**
+   * Write battery RAM when it has changed.
+   *
+   * This used to run only when the game stopped, which meant always-on mode
+   * never persisted a battery save at all — quit while playing and the RAM was
+   * gone. A 5 s poll while running plus a forced flush at every stop bounds the
+   * loss. `force` skips the unchanged check (used before switching cartridges).
+   */
+  function bindBatteryFlush(force = false) {
+    const core = coreRef.current
+    const info = rom.get()
+    const saves = savesRef.current
+    if (!core || !info?.hasBattery || !saves) return
+    let battery = null
+    try {
+      battery = core.batterySave()
+    } catch {
+      return
+    }
+    if (!battery || battery.length === 0) return
+    if (!force && sameBytes(lastBatteryRef.current, battery)) return
+    // Record the snapshot only once the write reports success, so a failed or
+    // full disk is retried on the next poll instead of being treated as saved.
+    const snapshot = Uint8Array.from(battery)
+    void saves
+      .write(info.sha256, 'battery', battery)
+      .then(ok => {
+        if (ok) lastBatteryRef.current = snapshot
+      })
+      .catch(() => {})
+  }
+
   // --- loading -----------------------------------------------------------
-  const bootRom = async (bytes, name) => {
+  const bootRom = async (bytes, name, options = {}) => {
     const core = coreRef.current
     const saves = savesRef.current
     if (!core) return
     phase.set('loading')
     lastError.set('')
+    refusedRef.current = null
     try {
-      const info = await core.loadRom(bytes)
+      if (core.hasCartridge) {
+        // The outgoing cartridge's RAM belongs to the outgoing cartridge, so
+        // flush it before the core swaps the MBC out from under it.
+        bindBatteryFlush(true)
+        await autoSaveNow('switch')
+      }
+      const info = await core.loadRom(bytes, options)
       const loaded = {
         ...info,
         name: name ?? info.title ?? 'cartridge',
@@ -179,7 +319,11 @@ export function CartridgePane() {
       }
       rom.set(loaded)
       core.setPalette(prefs.get().palette)
+      core.setAudioEnabled(prefs.get().audio)
       playerRef.current?.setSampleRate(core.audioSampleRate?.() ?? 44100)
+      playerRef.current?.setEnabled(prefs.get().audio)
+      lastBatteryRef.current = null
+      void refreshSlots()
 
       if (info.hasBattery) {
         const battery = await saves.read(info.sha256, 'battery')
@@ -222,7 +366,16 @@ export function CartridgePane() {
     } catch (loadError) {
       phase.set('error')
       lastError.set(loadError?.message ?? String(loadError))
+      // A refused header is the one failure the user can override: homebrew
+      // with a hand-written header loads fine, the checksum is just stale.
+      refusedRef.current = loadError?.code === 'header-checksum' ? { bytes, name } : null
     }
+  }
+
+  const forceLoad = () => {
+    const pending = refusedRef.current
+    if (!pending) return
+    void bootRom(pending.bytes, pending.name, { force: true })
   }
 
   const loadFile = async file => {
@@ -230,6 +383,7 @@ export function CartridgePane() {
       const { bytes, name } = await readRomFile(file)
       await bootRom(bytes, name)
     } catch (readError) {
+      refusedRef.current = null
       phase.set('error')
       lastError.set(readError?.message ?? String(readError))
     }
@@ -248,6 +402,7 @@ export function CartridgePane() {
     if (!core || !info || !saves) return
     try {
       const ok = await saves.write(info.sha256, slot, core.saveState())
+      if (ok) void refreshSlots()
       flash(ok ? `Saved to slot ${slot}` : `Could not save to slot ${slot}`)
     } catch (saveError) {
       flash(saveError?.message ?? 'Save failed')
@@ -274,6 +429,37 @@ export function CartridgePane() {
     }
   }
 
+  /** Put the cartridge back in its box: flush what belongs to it, then stop. */
+  const ejectCartridge = async () => {
+    const core = coreRef.current
+    const current = rom.get()
+    if (!core || !current) return
+    bindBatteryFlush(true)
+    await autoSaveNow('eject')
+    core.eject()
+    rom.set(null)
+    phase.set('empty')
+    lastError.set('')
+    refusedRef.current = null
+    lastBatteryRef.current = null
+    setSlotInfo({})
+    setSavesOpen(false)
+    clearHeld()
+    flash(`Ejected ${displayName(current.name)}`)
+  }
+
+  /** Power-cycle the cartridge, keeping its battery RAM. */
+  const resetCartridge = () => {
+    const core = coreRef.current
+    if (!core?.reset?.()) return
+    lastBatteryRef.current = null
+    autoSaveTickRef.current = 0
+    clearHeld()
+    core.redraw()
+    core.drawTo(context2dRef.current)
+    flash('Cartridge reset')
+  }
+
   // --- approval ----------------------------------------------------------
   const answerApproval = async choice => {
     const approval = busy.get().approval
@@ -284,7 +470,7 @@ export function CartridgePane() {
         ...(approval.prompt_id ? { request_id: approval.prompt_id } : {}),
         ...(approval.session_id ? { session_id: approval.session_id } : {})
       })
-      dispatch({ type: 'approval-cleared' })
+      dispatch({ type: 'approval-cleared', promptId: approval.prompt_id ?? null })
     } catch (respondError) {
       console.warn('[cartridge] approval.respond failed', respondError)
       flash('Answer this one in the chat — the pane could not reach the approval queue.')
@@ -302,13 +488,28 @@ export function CartridgePane() {
     const context2d = canvas.getContext('2d')
     context2dRef.current = context2d
     core.setPalette(prefs.get().palette)
+    core.setAudioEnabled(prefs.get().audio)
     player.setEnabled(prefs.get().audio)
 
     worker.core = core
     worker.player = player
     worker.saves = saves
     worker.effects = effectBridge
-    effectBridge.onEffect = effect => void effectsBridge.current?.(effect)
+    // Atoms outlive the component (the chip reads them too), so a pane that was
+    // closed and reopened would otherwise show the old cartridge's name over a
+    // blank screen: this mount has a fresh core with nothing inserted.
+    if (rom.get() && !core.hasCartridge) {
+      rom.set(null)
+      phase.set('empty')
+      setSlotInfo({})
+    }
+    // Effects are serialised: an auto-save and the auto-restore that follows it
+    // must not race, or an instant answer restores the previous slot.
+    effectBridge.onEffect = effect => {
+      effectQueue.current = effectQueue.current
+        .then(() => effectsBridge.current?.(effect))
+        .catch(error => console.warn('[cartridge] effect failed', effect.type, error))
+    }
     coreRef.current = core
     playerRef.current = player
     savesRef.current = saves
@@ -320,27 +521,80 @@ export function CartridgePane() {
         // One blit per completed frame, and only after the frame ended.
         core.drawTo(context2d)
         player.push(core.audioSamples())
+
         servedRef.current += FRAME_MS
         if (servedRef.current >= 1000) {
           const whole = Math.floor(servedRef.current)
           servedRef.current -= whole
-          const before = busy.get()
-          dispatch({ type: 'tick', ms: whole })
           // Time served means "played while the agent worked" (spec §13.3), so
-          // it only accrues during a turn, never in always-on idling.
-          if (before.turnBusy) addServed(whole)
+          // it only accrues during a turn, never in always-on idling. The
+          // reducer has no counter of its own; this atom is the one number the
+          // chip and the header both show.
+          if (busy.get().turnBusy) addServed(whole)
+        }
+
+        batteryTickRef.current += FRAME_MS
+        if (batteryTickRef.current >= BATTERY_SAVE_MS) {
+          batteryTickRef.current = 0
+          bindBatteryFlush()
+        }
+
+        autoSaveTickRef.current += FRAME_MS
+        if (autoSaveTickRef.current >= AUTO_SAVE_MS) {
+          autoSaveTickRef.current = 0
+          void autoSaveNow('periodic')
         }
       },
-      shouldRun: () => isRunning(busy.get()) && Boolean(rom.get())
+      shouldRun: () => phase.get() === 'ready' && isRunning(busy.get()) && Boolean(rom.get())
     })
     pacerRef.current = pacer
     pacer.start()
 
+    // --- on-screen visibility -------------------------------------------
+    // The host keeps a hidden pane MOUNTED (inactive tab, minimised zone), so
+    // "mounted" is not "watchable", and document.visibilityState only knows
+    // about the whole window. checkVisibility() reports inherited CSS
+    // visibility, and an IntersectionObserver catches a pane scrolled out of
+    // the viewport. Polling is needed because a tab switch changes an ancestor's
+    // CSS, which fires neither observer nor event.
+    const container = containerRef.current
+    let intersecting = true
+    let lastHidden = null
+    let visibilityPoll = 0
+    const evaluateVisibility = () => {
+      const cssVisible =
+        container?.checkVisibility?.({ checkVisibilityCSS: true, contentVisibilityAuto: true }) ?? true
+      const visible = computePaneVisible({
+        documentHidden: typeof document !== 'undefined' && document.visibilityState !== 'visible',
+        cssVisible,
+        intersecting
+      })
+      // Dispatch only on a change: the reducer allocates a fresh state for any
+      // action, and a poll that fired every 750 ms would re-render the pane for
+      // nothing.
+      if (lastHidden !== !visible) {
+        lastHidden = !visible
+        dispatch({ type: 'pane-hidden', value: !visible })
+        if (!visible) bindBatteryFlush()
+      }
+    }
+    const observer =
+      container && typeof IntersectionObserver !== 'undefined'
+        ? new IntersectionObserver(
+            entries => {
+              for (const entry of entries) {
+                if (entry.target === container) intersecting = entry.isIntersecting
+              }
+              evaluateVisibility()
+            },
+            { threshold: 0 }
+          )
+        : null
+    observer?.observe(container)
+
     // A window blur must release every held key, or the D-pad sticks.
     const onBlur = () => clearHeld()
-    const onVisibility = () => {
-      dispatch({ type: 'pane-hidden', value: document.visibilityState !== 'visible' })
-    }
+    const onVisibility = () => evaluateVisibility()
 
     // Keys are captured at the window (capture phase) while the pane holds
     // focus. Without this, Enter reaches the app's own "focus the composer"
@@ -352,7 +606,17 @@ export function CartridgePane() {
       // paused console. Answering is a click, so nothing is lost.
       if (busy.get().approvalPending) return
       const button = buttonForCode(prefs.get().bindings, event.code)
-      if (!button) return
+      if (!button) {
+        // An unbound key while a text field holds focus means the user is
+        // typing, not playing. Hand the keyboard back instead of swallowing a
+        // letter the `beforeinput` guard would otherwise eat.
+        if (isEditable(document.activeElement)) releaseFocus()
+        return
+      }
+      // This key belongs to the game. If the host moved focus into the composer
+      // a moment ago, cancel the pending "let go of the keyboard" decision: the
+      // release is deferred exactly so a bound key can veto it.
+      window.clearTimeout(pendingFocusReleaseRef.current)
       event.preventDefault()
       event.stopPropagation()
       // The app registers its own key handling before a plugin can, so on Enter
@@ -360,7 +624,9 @@ export function CartridgePane() {
       // the focus back: a key pressed while the game had focus belongs to the
       // game.
       window.setTimeout(() => {
-        if (phase.get() !== 'empty') canvasRef.current?.focus()
+        if (phase.get() !== 'empty' && !isEditable(document.activeElement)) {
+          canvasRef.current?.focus()
+        }
       }, 0)
       if (event.repeat) return
       ensurePlayFromInput()
@@ -380,13 +646,7 @@ export function CartridgePane() {
     // text insertion itself while the game owns the keyboard.
     const onBeforeInput = event => {
       if (!paneFocusRef.current) return
-      const target = event.target
-      const editable =
-        target &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.isContentEditable === true)
-      if (!editable) return
+      if (!isEditable(event.target)) return
       event.preventDefault()
       event.stopPropagation()
     }
@@ -394,9 +654,14 @@ export function CartridgePane() {
     const onOutsidePointerDown = event => {
       const root = rootRef.current
       if (!root || root.contains(event.target)) return
-      paneFocusRef.current = false
-      setCanvasFocused(false)
-      clearHeld()
+      releaseFocus()
+    }
+
+    // Closing the app is the one stop that cannot wait for the next turn.
+    const onPageHide = () => {
+      bindBatteryFlush(true)
+      void autoSaveNow('quit')
+      flushServed()
     }
 
     window.addEventListener('blur', onBlur)
@@ -405,8 +670,10 @@ export function CartridgePane() {
     window.addEventListener('beforeinput', onBeforeInput, true)
     window.addEventListener('keypress', onBeforeInput, true)
     window.addEventListener('keyup', onCaptureKeyUp, true)
+    window.addEventListener('pagehide', onPageHide)
     document.addEventListener('visibilitychange', onVisibility)
-    onVisibility()
+    evaluateVisibility()
+    visibilityPoll = window.setInterval(evaluateVisibility, 750)
 
     // Restore the cartridge the user asked us to remember.
     const remembered = worker.ctx?.storage.get('rom.remembered', null)
@@ -422,17 +689,27 @@ export function CartridgePane() {
     }
 
     return () => {
+      // A pane can unmount while a game is running (the host closes the tab).
+      // Hold the frame and the battery RAM before the core goes away.
+      bindBatteryFlush(true)
+      void autoSaveNow('quit')
       pacer.stop()
       player.dispose()
+      observer?.disconnect()
+      window.clearInterval(visibilityPoll)
       window.removeEventListener('blur', onBlur)
+      window.removeEventListener('pointerdown', onOutsidePointerDown, true)
       window.removeEventListener('keydown', onCaptureKeyDown, true)
       window.removeEventListener('beforeinput', onBeforeInput, true)
       window.removeEventListener('keypress', onBeforeInput, true)
       window.removeEventListener('keyup', onCaptureKeyUp, true)
+      window.removeEventListener('pagehide', onPageHide)
       document.removeEventListener('visibilitychange', onVisibility)
       window.clearTimeout(noticeTimerRef.current)
+      window.clearTimeout(pendingFocusReleaseRef.current)
       flushServed()
       clearHeld()
+      effectBridge.onEffect = null
       coreRef.current = null
       pacerRef.current = null
       playerRef.current = null
@@ -446,15 +723,16 @@ export function CartridgePane() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Busy-state effects: the reducer asks, this performs.
+  // Busy-state effects: the reducer asks, this performs. Calls arrive through
+  // the queue installed above, so an auto-save is complete before the
+  // auto-restore that follows it reads the slot.
   effectsBridge.current = async effect => {
     const core = coreRef.current
     const info = rom.get()
     const saves = savesRef.current
     if (!core || !info || !saves) return
     if (effect.type === 'auto-save') {
-      const ok = await saves.write(info.sha256, AUTO_SLOT, core.saveState())
-      if (ok) flash('Paused for the agent — frame held')
+      await autoSaveNow('interrupt')
     }
     if (effect.type === 'auto-restore') {
       const bytes = await saves.read(info.sha256, AUTO_SLOT)
@@ -500,38 +778,39 @@ export function CartridgePane() {
     commands.togglePlay = () => dispatch({ type: 'user-toggle-play' })
     commands.toggleMute = () => setPrefs({ audio: !prefs.get().audio })
     commands.openSaves = () => setSavesOpen(open => !open)
-    return () => {
-      for (const key of Object.keys(commands)) commands[key] = null
-    }
+    commands.eject = () => void ejectCartridge()
+    commands.reset = () => resetCartridge()
+    return () => clearCommands()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const bindBatteryFlush = () => {
-    const core = coreRef.current
-    const info = rom.get()
-    const saves = savesRef.current
-    if (!core || !info?.hasBattery || !saves) return
-    const battery = core.batterySave()
-    if (battery) void saves.write(info.sha256, 'battery', battery)
-  }
-
+  // A stop is a save point: the turn ended, the user paused, or the window went
+  // away. Hold the frame here so a restart lands where play actually stopped,
+  // not at the last approval.
   useEffect(() => {
-    if (isRunning(state)) return
-    bindBatteryFlush()
+    const previous = lastStatusRef.current
+    lastStatusRef.current = state.status
+    if (!isRunning(state)) {
+      bindBatteryFlush()
+      // An interrupt has its own auto-save (the reducer's effect); anything else
+      // that stops the game is a save point in its own right.
+      if (previous === STATUS.PLAYING && state.status !== STATUS.INTERRUPTED) {
+        void autoSaveNow('stop')
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.status])
+
+  // The slot list is state, not a render-time read: nothing re-renders when a
+  // save lands on disk, and the ages would freeze at whatever they were on open.
+  useEffect(() => {
+    if (savesOpen) void refreshSlots()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savesOpen])
 
   // --- presentation ------------------------------------------------------
   const statusTone =
     state.status === STATUS.PLAYING ? 'playing' : state.status === STATUS.INTERRUPTED ? 'interrupted' : 'idle'
-  const statusLabel =
-    state.status === STATUS.PLAYING
-      ? 'playing'
-      : state.status === STATUS.INTERRUPTED
-        ? 'paused · approval'
-        : state.status === STATUS.PAUSED_BY_USER
-          ? 'paused'
-          : 'standby'
 
   const onDrop = event => {
     event.preventDefault()
@@ -556,12 +835,26 @@ export function CartridgePane() {
       setCanvasFocused(false)
       // If the lock is held we are about to take focus back, so keep the pressed
       // keys: clearing here would swallow the very press we are handling.
-      if (!paneFocusRef.current) clearHeld()
-      if (paneFocusRef.current) {
-        window.setTimeout(() => {
-          if (paneFocusRef.current) canvasRef.current?.focus()
-        }, 0)
+      if (!paneFocusRef.current) {
+        clearHeld()
+        return
       }
+      // Focus landing in a text field is how a user gets back to the composer,
+      // by clicking it or by Tab. Decide at the END of this task instead of now:
+      // the host moves focus to the composer *before* a plugin sees Enter, so an
+      // immediate release would hand the game's Start key to the chat. A bound
+      // keydown cancels this timer; anything else (Tab, a shortcut) lets it run.
+      const target = event.relatedTarget
+      if (isEditable(target) && !rootRef.current?.contains(target)) {
+        window.clearTimeout(pendingFocusReleaseRef.current)
+        pendingFocusReleaseRef.current = window.setTimeout(() => releaseFocus(), 0)
+        return
+      }
+      window.setTimeout(() => {
+        if (paneFocusRef.current && !isEditable(document.activeElement)) {
+          canvasRef.current?.focus()
+        }
+      }, 0)
     },
     onClick: () => {
       void playerRef.current?.unlock()
@@ -617,18 +910,49 @@ export function CartridgePane() {
   const errorState =
     currentPhase === 'error'
       ? jsxs('div', {
-          className: 'flex h-full flex-col items-center justify-center gap-2 px-4 text-center',
+          className: 'absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 px-4 text-center',
+          // A dialog over a live game needs its own surface: the theme tokens are
+          // translucent, and blurred frames behind the text made the one message
+          // that matters hard to read. Fixed colours on purpose, so it reads the
+          // same in a light or dark theme.
+          style: { background: 'rgba(9, 11, 15, 0.94)' },
           children: [
-            jsx('div', { className: 'text-sm text-(--ui-text-secondary)', children: 'That cartridge did not load' }),
-            jsx('div', { className: 'max-w-[26rem] text-xs text-(--ui-text-tertiary)', children: error }),
-            jsx('button', {
-              type: 'button',
-              className: 'rounded border border-(--ui-stroke-secondary) px-2 py-1 text-xs text-(--ui-text-secondary)',
-              onClick: () => {
-                phase.set(current ? 'ready' : 'empty')
-                lastError.set('')
-              },
-              children: 'Dismiss'
+            jsx('div', {
+              className: 'text-sm',
+              style: { color: 'rgba(255, 255, 255, 0.94)' },
+              children: 'That cartridge did not load'
+            }),
+            jsx('div', {
+              className: 'max-w-[26rem] text-xs',
+              style: { color: 'rgba(255, 255, 255, 0.64)' },
+              children: error
+            }),
+            jsxs('div', {
+              className: 'flex flex-wrap items-center justify-center gap-2',
+              children: [
+                // A stale header checksum is a homebrew problem, not a broken
+                // file, so the user gets the last word on it.
+                refusedRef.current
+                  ? jsx('button', {
+                      type: 'button',
+                      className: 'rounded border px-2 py-1 text-xs',
+                      style: { color: 'rgba(255, 255, 255, 0.92)', borderColor: 'rgba(255, 255, 255, 0.3)' },
+                      onClick: forceLoad,
+                      children: 'Load anyway'
+                    })
+                  : null,
+                jsx('button', {
+                  type: 'button',
+                  className: 'rounded border px-2 py-1 text-xs',
+                  style: { color: 'rgba(255, 255, 255, 0.8)', borderColor: 'rgba(255, 255, 255, 0.3)' },
+                  onClick: () => {
+                    phase.set(current ? 'ready' : 'empty')
+                    lastError.set('')
+                    refusedRef.current = null
+                  },
+                  children: 'Dismiss'
+                })
+              ]
             })
           ]
         })
@@ -696,7 +1020,7 @@ export function CartridgePane() {
           className: 'pointer-events-none absolute inset-x-0 bottom-1 flex justify-center',
           children: jsx('div', {
             className: 'rounded bg-(--ui-surface, transparent) px-2 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
-            children: 'the agent is back'
+            children: 'the agent is back in this chat'
           })
         })
       : null
@@ -943,20 +1267,34 @@ export function CartridgePane() {
         })
       : null
 
-  const savePanel = savesOpen    ? jsxs('div', {
+  const savePanel = savesOpen
+    ? jsxs('div', {
         className: 'absolute inset-x-2 top-2 z-10 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-surface, transparent) p-2 shadow-lg',
         children: [
-          jsx('div', {
+          jsxs('div', {
             className: 'mb-1 flex items-center justify-between text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
-            children: jsx('span', { children: 'save states' })
+            children: [
+              jsx('span', { children: 'save states' }),
+              jsx('span', {
+                title: 'Written when the game stops and every 30 seconds while it runs',
+                children: slotInfo[AUTO_SLOT]
+                  ? `auto · ${formatAgo(slotInfo[AUTO_SLOT].at)}`
+                  : 'auto · not written yet'
+              })
+            ]
           }),
-          ...SLOTS.map(slot =>
-            jsxs(
+          ...SLOTS.map(slot => {
+            const meta = slotInfo[slot]
+            return jsxs(
               'div',
               {
                 className: 'flex items-center justify-between gap-2 py-0.5',
                 children: [
                   jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: `slot ${slot}` }),
+                  jsx('span', {
+                    className: 'flex-1 truncate pl-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
+                    children: meta ? `${formatAgo(meta.at)} · ${formatBytes(meta.size)}` : 'empty'
+                  }),
                   jsxs('span', {
                     className: 'flex gap-1',
                     children: [
@@ -968,7 +1306,10 @@ export function CartridgePane() {
                       }),
                       jsx('button', {
                         type: 'button',
-                        className: 'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)',
+                        disabled: !meta,
+                        className:
+                          'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)',
+                        style: { opacity: meta ? 1 : 0.45 },
                         onClick: () => void readSlot(slot),
                         children: 'load'
                       })
@@ -978,10 +1319,34 @@ export function CartridgePane() {
               },
               slot
             )
-          ),
-          jsx('div', {
-            className: 'mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
-            children: 'an automatic slot is written when the agent interrupts'
+          }),
+          jsxs('div', {
+            className: 'mt-1.5 flex items-center justify-between gap-2 border-t border-(--ui-stroke-secondary) pt-1',
+            children: [
+              jsx('span', {
+                className: 'text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
+                children: 'auto save on every stop, and every 30 s'
+              }),
+              jsxs('span', {
+                className: 'flex gap-1',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: 'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+                    onClick: resetCartridge,
+                    title: 'Power-cycle the cartridge, keeping its battery save',
+                    children: 'reset'
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: 'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+                    onClick: () => void ejectCartridge(),
+                    title: 'Remove the cartridge',
+                    children: 'eject'
+                  })
+                ]
+              })
+            ]
           })
         ]
       })
@@ -1000,10 +1365,18 @@ export function CartridgePane() {
       paneFocusRef.current = true
     },
     onBlur: event => {
-      // The lock is released by a click outside the pane, never by focus drift.
+      // The lock is released by a click outside the pane, or by a deliberate
+      // move into a text field — deferred, so a bound key can still veto it.
       if (event.currentTarget.contains(event.relatedTarget)) return
       setCanvasFocused(false)
-      if (!paneFocusRef.current) clearHeld()
+      if (!paneFocusRef.current) {
+        clearHeld()
+        return
+      }
+      if (isEditable(event.relatedTarget)) {
+        window.clearTimeout(pendingFocusReleaseRef.current)
+        pendingFocusReleaseRef.current = window.setTimeout(() => releaseFocus(), 0)
+      }
     },
     onDragOver: event => event.preventDefault(),
     onDrop,
@@ -1030,7 +1403,7 @@ export function CartridgePane() {
           jsxs('div', {
             className: 'flex items-center gap-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-quaternary)',
             children: [
-              jsx('span', { children: statusLabel }),
+              jsx('span', { children: statusLabel(state) }),
               jsx('span', { children: formatServed(servedToday.ms) })
             ]
           })

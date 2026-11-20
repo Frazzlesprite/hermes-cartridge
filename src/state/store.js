@@ -73,7 +73,12 @@ export function setPrefs(patch) {
   }
   if (patch.mode) dispatch({ type: 'set-mode', value: patch.mode })
   if (patch.palette) worker.core?.setPalette(patch.palette)
-  if (typeof patch.audio === 'boolean') worker.player?.setEnabled(patch.audio)
+  if (typeof patch.audio === 'boolean') {
+    worker.player?.setEnabled(patch.audio)
+    // Stop the core copying mixer output while muted. The player's gain is
+    // still what makes the sound audible; this is the cheaper half.
+    worker.core?.setAudioEnabled?.(patch.audio)
+  }
   return next
 }
 

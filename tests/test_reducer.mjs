@@ -7,6 +7,7 @@ import {
   createState,
   isRunning,
   needsAttention,
+  statusLabel,
   STATUS,
   MODE_ALWAYS,
   MODE_INTERRUPTED
@@ -39,12 +40,10 @@ test('stops when the agent comes back, and does not reset', () => {
   const { state } = run(
     createState(),
     { type: 'turn-busy', value: true },
-    { type: 'tick', ms: 5000 },
     { type: 'turn-busy', value: false }
   )
   assert.equal(state.status, STATUS.IDLE)
   assert.equal(isRunning(state), false)
-  assert.equal(state.timeServedMs, 5000, 'time served survives the pause')
 })
 
 test('an approval pauses immediately and asks for an auto-save', () => {
@@ -122,24 +121,43 @@ test('always mode is idle before any turn starts', () => {
   assert.equal(state.status, STATUS.PLAYING, 'always means always, turn or no turn')
 })
 
-test('time served only counts while playing during a turn', () => {
-  const idle = run(createState(), { type: 'tick', ms: 1000 }).state
-  assert.equal(idle.timeServedMs, 0)
+test('time served is not the reducer’s business', () => {
+  // The durable counter lives in the `served` atom, which the pane feeds from
+  // frames that actually advanced. A second counter here was tested but never
+  // displayed, so it is gone; `tick` is now an unknown action.
+  const s = createState({ turnBusy: true })
+  const result = reduce(s, { type: 'tick', ms: 1000 })
+  assert.equal(result.state, s)
+  assert.deepEqual(result.effects, [])
+})
 
-  const paused = run(
+test('a settle event for another prompt does not clear the card', () => {
+  const busy = run(
     createState(),
     { type: 'turn-busy', value: true },
-    { type: 'user-pause' },
-    { type: 'tick', ms: 1000 }
+    { type: 'approval', value: true, approval: { prompt_id: 'p1' } }
   ).state
-  assert.equal(paused.timeServedMs, 0)
+  assert.equal(busy.status, STATUS.INTERRUPTED)
 
-  const playing = run(
+  const ignored = reduce(busy, { type: 'approval-cleared', promptId: 'p2' })
+  assert.equal(ignored.state, busy, 'a different prompt leaves the state untouched')
+  assert.deepEqual(ignored.effects, [])
+  assert.equal(ignored.state.approvalPending, true)
+  assert.equal(ignored.state.approval.prompt_id, 'p1')
+
+  const cleared = reduce(busy, { type: 'approval-cleared', promptId: 'p1' })
+  assert.equal(cleared.state.approvalPending, false)
+  assert.equal(cleared.state.status, STATUS.PLAYING)
+  assert.deepEqual(cleared.effects, [{ type: 'auto-restore' }])
+})
+
+test('a settle event without an id still clears, for older hosts', () => {
+  const busy = run(
     createState(),
-    { type: 'turn-busy', value: true },
-    { type: 'tick', ms: 1000 }
+    { type: 'approval', value: true, approval: { prompt_id: 'p1' } }
   ).state
-  assert.equal(playing.timeServedMs, 1000)
+  const cleared = reduce(busy, { type: 'approval-cleared' })
+  assert.equal(cleared.state.approvalPending, false)
 })
 
 test('unknown actions are ignored without allocating a new state', () => {
@@ -147,4 +165,14 @@ test('unknown actions are ignored without allocating a new state', () => {
   const result = reduce(s, { type: 'nonsense' })
   assert.equal(result.state, s)
   assert.deepEqual(result.effects, [])
+})
+
+test('status labels are one vocabulary for every surface', () => {
+  assert.equal(statusLabel(createState()), 'standby')
+  assert.equal(statusLabel(createState({ mode: MODE_ALWAYS })), 'playing')
+  assert.equal(statusLabel(createState({ userPaused: true })), 'paused')
+  assert.equal(
+    statusLabel(createState({ mode: MODE_INTERRUPTED, approvalPending: true })),
+    'paused · approval'
+  )
 })
